@@ -33,6 +33,10 @@ Cada apertura y cierre se manda con `POST <EXECUTOR_URL>/signal` y la cabecera `
 
 `direction` ahora puede ser `LONG` o `SHORT`, y `level` lleva el % del cuerpo de la vela que disparó la señal.
 
+### Latencia
+
+Las señales salen por conexiones HTTP persistentes (keep-alive): `EXECUTOR_WORKERS` hilos (4 por defecto) mantienen abierta su conexión con el executor y la refrescan con un `GET /api/state` cada `EXECUTOR_WARM_S` segundos (20) si no hay señales. Así cada señal paga solo el viaje de red, sin abrir TCP+TLS de nuevo. La entrada usa el cierre de la vela como precio. La web muestra, para la última señal, los ms de decisión, los ms del HTTP al executor y el total desde que llegó el cierre de Binance.
+
 ### Cambiar el link en caliente
 
 - **Web**: bloque *Executor* → pegar el link nuevo (y el secreto si cambia) → *Cambiar link*. La web avisa si el executor nuevo responde.

@@ -27,13 +27,16 @@ import asyncio
 import atexit
 import concurrent.futures
 import json
+import http.client
 import os
+import queue
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
@@ -87,6 +90,8 @@ EXECUTOR_URL    = os.getenv("EXECUTOR_URL", "https://executor-5lu0.onrender.com"
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 # Si se define, los POST de la web (cambiar executor, cerrar) exigen este token.
 ADMIN_TOKEN     = os.getenv("ADMIN_TOKEN", "").strip()
+EXECUTOR_WORKERS = max(1, int(os.getenv("EXECUTOR_WORKERS", "4")))      # envíos en paralelo
+EXECUTOR_WARM_S  = float(os.getenv("EXECUTOR_WARM_S", "20"))            # GET para mantener viva la conexión
 
 # ── Persistencia ──────────────────────────────────────────────────────────────
 SETTINGS_FILE     = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
@@ -132,6 +137,11 @@ class ExecutorBridge:
         self.errors = 0
         self.last_error = ""
         self.last_ok_ts = 0.0
+        self.last_http_ms = 0.0
+        self.last_total_ms = 0.0
+        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        self._workers: List[threading.Thread] = []
+        self._start_lock = threading.Lock()
 
     @staticmethod
     def clean_url(url: str) -> str:
@@ -148,36 +158,109 @@ class ExecutorBridge:
         except Exception:
             pass
 
-    def send_sync(self, payload: dict, target: ExecutorTarget) -> bool:
+    # ── Envío con conexiones persistentes ────────────────────────────────────
+    # Abrir TCP+TLS por cada señal cuesta 100-300 ms hasta Render. Cada hilo
+    # trabajador mantiene su conexión abierta (keep-alive) y la "calienta" con
+    # un GET cada EXECUTOR_WARM_S si está ociosa, así una señal sale en el RTT.
+
+    def _ensure_workers(self) -> None:
+        if self._workers:
+            return
+        with self._start_lock:
+            if self._workers:
+                return
+            for i in range(EXECUTOR_WORKERS):
+                t = threading.Thread(target=self._worker, daemon=True, name=f"executor-{i}")
+                t.start()
+                self._workers.append(t)
+
+    def _warm_conn(self, conns: dict) -> None:
+        target = self.target
         if not target.url:
-            return False
-        req = urllib.request.Request(
-            f"{target.url}/signal",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "X-Signal-Secret": target.secret},
-            method="POST",
-        )
+            return
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                resp.read()
-            self.sent += 1
-            self.last_ok_ts = time.time()
-            self._log(f"[executor] ✓ {payload.get('action')} {payload.get('symbol')} "
-                      f"{payload.get('direction')} → {target.url}")
-            return True
+            self._request(conns, target, "GET", "/api/state", None, retry=False)
+        except Exception:
+            pass                        # la próxima señal abrirá una conexión nueva
+
+    def _worker(self) -> None:
+        conns: Dict[Tuple[str, str], http.client.HTTPConnection] = {}
+        self._warm_conn(conns)          # conexión lista antes de la primera señal
+        while True:
+            try:
+                item = self._queue.get(timeout=EXECUTOR_WARM_S)
+            except queue.Empty:
+                self._warm_conn(conns)
+                continue
+            payload, target, t0 = item
+            self._deliver(conns, payload, target, t0)
+
+    def _request(self, conns: dict, target: ExecutorTarget, method: str, path: str,
+                 body: Optional[bytes], retry: bool = True) -> Tuple[int, bytes]:
+        u = urlsplit(target.url)
+        key = (u.scheme, u.netloc)
+        full = (u.path or "") + path
+        headers = {"Content-Type": "application/json", "X-Signal-Secret": target.secret,
+                   "Connection": "keep-alive"}
+        for attempt in range(2):
+            conn = conns.get(key)
+            reused = conn is not None
+            if conn is None:
+                cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+                conn = cls(u.hostname, u.port, timeout=self.timeout)
+                conns[key] = conn
+            try:
+                conn.request(method, full, body=body, headers=headers)
+                resp = conn.getresponse()
+                return resp.status, resp.read()
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                conns.pop(key, None)
+                # Una conexión reutilizada que el servidor ya cerró falla antes de
+                # entregar la petición: se reintenta UNA vez con conexión nueva.
+                # Una conexión nueva que falla no se reintenta (evita duplicados).
+                if attempt == 0 and reused and retry:
+                    continue
+                raise
+        raise RuntimeError("sin conexión")
+
+    def _deliver(self, conns: dict, payload: dict, target: ExecutorTarget, t0: float) -> bool:
+        what = f"{payload.get('action')} {payload.get('symbol')} {payload.get('direction')}"
+        t_send = time.perf_counter()
+        try:
+            status, data = self._request(conns, target, "POST", "/signal",
+                                         json.dumps(payload).encode("utf-8"))
+            if status >= 400:
+                raise RuntimeError(f"HTTP {status}: {data[:200].decode('utf-8', 'replace')}")
         except Exception as exc:
             self.errors += 1
-            self.last_error = f"{payload.get('action')} {payload.get('symbol')}: {exc}"
+            self.last_error = f"{what}: {exc}"
             self._log(f"[executor] ✗ error enviando {self.last_error} → {target.url}")
             return False
+        now = time.perf_counter()
+        http_ms = (now - t_send) * 1000
+        total_ms = (now - t0) * 1000 if t0 else http_ms
+        self.sent += 1
+        self.last_ok_ts = time.time()
+        self.last_http_ms = http_ms
+        self.last_total_ms = total_ms
+        since = f" | desde el cierre de la vela {total_ms:.0f} ms" if t0 else ""
+        self._log(f"[executor] ✓ {what} → {target.url} | HTTP {http_ms:.0f} ms{since}")
+        return True
 
-    def send(self, payload: dict) -> None:
-        """No bloquea: el envío va en un hilo con el destino vigente AHORA."""
+    def send(self, payload: dict, t0: float = 0.0) -> None:
+        """No bloquea: encola la señal con el destino vigente AHORA.
+        t0 = perf_counter() del mensaje de Binance que la originó (para medir)."""
         target = self.target
         if not target.url:
             self._log(f"[executor] sin URL: no se envía {payload.get('action')} {payload.get('symbol')}")
             return
-        threading.Thread(target=self.send_sync, args=(payload, target), daemon=True).start()
+        self._ensure_workers()
+        self._queue.put((payload, target, t0))
+
+    def warm(self) -> None:
+        """Arranca los hilos y abre las conexiones antes de la primera señal."""
+        self._ensure_workers()
 
     def probe(self, url: str) -> Tuple[bool, str]:
         """GET <url>/api/state para comprobar que el Executor responde."""
@@ -273,6 +356,7 @@ class KlineBot:
         self._evals: Dict[int, List[Tuple[float, str, float, float]]] = {}
         self._evals_lock = threading.Lock()
         self.eval_count = 0
+        self._decide_ms: Deque[float] = deque(maxlen=200)    # cierre recibido → señal encolada
 
         # Upstash desactivado por ahora: solo copia local (backend=None).
         self._store_desc = f"solo disco local ({RECOVERY_FILE})"
@@ -384,6 +468,7 @@ class KlineBot:
                  f"executor → {self.executor.target.url or '(vacío)'}")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
+        self.executor.warm()
         await self._init_symbols()
 
         # El estado (posiciones abiertas) se restaura ANTES de abrir los WebSockets.
@@ -509,7 +594,8 @@ class KlineBot:
             return
         loop = self.loop
         if loop is not None:
-            loop.call_soon_threadsafe(self._handle_signal, symbol, direction, candle, time.time())
+            loop.call_soon_threadsafe(self._handle_signal, symbol, direction, candle, time.time(),
+                                      time.perf_counter())
 
     def _record_eval(self, symbol: str, candle: Candle) -> None:
         body = strategy.body_change_pct(candle.open, candle.close)
@@ -564,7 +650,8 @@ class KlineBot:
             "action":    action,
         })
 
-    def _handle_signal(self, symbol: str, direction: str, candle: Candle, arrived: float) -> None:
+    def _handle_signal(self, symbol: str, direction: str, candle: Candle, arrived: float,
+                       t0: float = 0.0) -> None:
         """Corre en el loop del bot. Decide si abrir y lanza la apertura."""
         if self._last_candle.get(symbol, -1) >= candle.open_time:
             return                                          # duplicado tras reconexión
@@ -589,7 +676,9 @@ class KlineBot:
             self._record_signal(symbol, direction, candle, "ignorada: en pausa tras cierre")
             return
 
-        price = self._price(symbol) or candle.close
+        # El cierre de la vela es el último trade: más fresco que el mark price
+        # (1-3 s) que hay para los símbolos sin bookTicker suscrito.
+        price = candle.close
         f = self.filters.get(symbol, {})
         qty, eff, why = strategy.size_order(
             NOTIONAL_USDT, price, f.get("stepSize", 0.001), f.get("minQty", 0.0),
@@ -613,7 +702,8 @@ class KlineBot:
         if self.price_cache is not None:
             self.price_cache.ensure_symbols([symbol])       # bookTicker en tiempo real
         self.store.mark_dirty(True)
-        self._record_signal(symbol, direction, candle, f"abierta #{pos.trade_id}")
+        decide_ms = (time.perf_counter() - t0) * 1000 if t0 else 0.0
+        self._record_signal(symbol, direction, candle, f"abierta #{pos.trade_id} en {decide_ms:.1f} ms")
         self.log(f"ABRE {direction} {symbol} | vela {candle.open:g}→{candle.close:g} ({body:+.2f}%) | "
                  f"px={price:g} qty={qty:g} ({eff:.2f} USDT) | TP {pos.tp_price:g} | trade #{pos.trade_id}")
         self.executor.send({
@@ -625,7 +715,8 @@ class KlineBot:
             "quantity":  qty,
             "notional":  round(eff, 4),
             "level":     round(body, 4),
-        })
+        }, t0)
+        self._decide_ms.append(decide_ms)
 
     # ── Salidas: ticks de precio (hilo del WS de precios) ─────────────────────
 
@@ -853,6 +944,9 @@ class KlineBot:
                 "url": self.executor.target.url, "sent": self.executor.sent,
                 "errors": self.executor.errors, "last_error": self.executor.last_error,
                 "last_ok": _utc(self.executor.last_ok_ts, "%H:%M:%S") if self.executor.last_ok_ts else "",
+                "http_ms": round(self.executor.last_http_ms, 1),
+                "total_ms": round(self.executor.last_total_ms, 1),
+                "decide_ms": round(sum(self._decide_ms) / len(self._decide_ms), 2) if self._decide_ms else None,
             },
             "klines": {
                 "symbols": k1.get("symbols", 0), "with_data": k1.get("with_data", 0),
@@ -1070,6 +1164,7 @@ HTML = r"""<!doctype html>
   <div class="card">
     <h2>Executor</h2>
     <div class="muted">Actual: <b id="exUrl">—</b> · enviadas <span id="exSent">0</span> · errores <span id="exErr">0</span></div>
+    <div class="muted" id="exLat" style="margin-top:4px"></div>
     <form id="exForm" style="margin-top:10px">
       <input id="exNew" type="url" placeholder="https://mi-executor.onrender.com" autocomplete="off">
       <input id="exSecret" type="password" placeholder="Secreto (opcional, vacío = mantener)" autocomplete="off">
@@ -1160,6 +1255,10 @@ async function refresh() {
   q('exUrl').textContent = d.executor.url || '(vacío: sin señales)';
   q('exSent').textContent = d.executor.sent;
   q('exErr').textContent = d.executor.errors;
+  const x = d.executor;
+  q('exLat').textContent = x.last_ok
+    ? `Última señal: decisión ${x.decide_ms ?? '—'} ms (media) · HTTP al executor ${x.http_ms} ms · total desde el cierre de Binance ${x.total_ms} ms`
+    : 'Latencia: aún no hay señales enviadas';
 
   q('tPos').innerHTML = d.positions.map(r => `<tr>
     <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span></td><td>${tag(r.direction)}</td>
