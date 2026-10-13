@@ -39,7 +39,7 @@ Cada apertura y cierre se manda con `POST <EXECUTOR_URL>/signal` y la cabecera `
 
   `url` vacío deja de mandar señales. Si `ADMIN_TOKEN` está definido, añade `-H 'X-Admin-Token: <token>'`.
 
-El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco y en Upstash, así que sobrevive a reinicios. Los cierres de posiciones ya abiertas van al link vigente en el momento del cierre.
+El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco local (`SETTINGS_FILE`). En Render free ese disco se borra al reiniciar, así que tras un redeploy vuelve a `EXECUTOR_URL`. Los cierres de posiciones ya abiertas van al link vigente en el momento del cierre.
 
 ## Variables de entorno
 
@@ -58,8 +58,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco y en
 | `KLINE_HISTORY` | `2` | Velas cerradas guardadas por símbolo. |
 | `REST_PROXY_URL` | — | Proxy para la única petición REST (`exchangeInfo`, al arrancar). |
 | `SYMBOL_REFRESH_HOURS` | `12` | Antigüedad máxima del caché de `exchangeInfo` en disco. |
-| `STATE_KEY_PREFIX` | `botkline` | Prefijo de las claves en Upstash. |
-| `UPSTASH_REDIS_REST_URL` / `_TOKEN` | — | Persistencia de posiciones abiertas e historial entre reinicios. |
+| `RECOVERY_FILE` | `/tmp/botkline_recovery.json` | Copia local de posiciones abiertas e historial. Upstash está desactivado por ahora: en Render free las posiciones abiertas se pierden al reiniciar. |
 
 ## Endpoints
 

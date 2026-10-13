@@ -54,10 +54,6 @@ services:
       - key: QUOTE_ASSET
         value: "USDT"
 
-      # ── Persistencia (Upstash) ──────────────────────────────────────────────
-      - key: STATE_KEY_PREFIX
-        value: "botkline"     # distinto del bot anterior para no mezclar posiciones
-
       # Respaldo si exchangeInfo falla y no hay caché en disco.
       - key: INITIAL_SYMBOLS
         value: >-

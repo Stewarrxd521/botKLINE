@@ -17,7 +17,8 @@ Estrategia
 
 Precios para el take profit: WS.py (!markPrice@arr de todos los símbolos +
 bookTicker en tiempo real de los que tienen posición abierta).
-Recuperación tras reinicio: state_store.py (Upstash Redis + copia local).
+Recuperación tras reinicio: state_store.py, solo con copia en disco local (Upstash
+desactivado por ahora: en Render free el disco se borra en cada reinicio).
 """
 
 from __future__ import annotations
@@ -46,7 +47,7 @@ if _HERE not in sys.path:
 
 from WS import SymbolWebSocketPriceCache                       # noqa: E402
 from kline_ws import Candle, KlineWebSocketStream              # noqa: E402
-from state_store import StateStore, backend_from_env, make_owner_id  # noqa: E402
+from state_store import StateStore, make_owner_id                    # noqa: E402
 import strategy                                               # noqa: E402
 
 
@@ -90,7 +91,7 @@ ADMIN_TOKEN     = os.getenv("ADMIN_TOKEN", "").strip()
 # ── Persistencia ──────────────────────────────────────────────────────────────
 SETTINGS_FILE     = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
 RECOVERY_FILE     = os.getenv("RECOVERY_FILE", os.path.join(tempfile.gettempdir(), "botkline_recovery.json"))
-STATE_KEY_PREFIX  = os.getenv("STATE_KEY_PREFIX", "botkline")
+STATE_KEY_PREFIX  = "botkline"
 STATE_TRADES_MAX  = int(os.getenv("STATE_TRADES_MAX", "5000"))
 STATE_BOOT_WAIT_S = float(os.getenv("STATE_BOOT_WAIT_S", "20"))
 STATE_PERSIST_SECS = float(os.getenv("STATE_PERSIST_SECS", "30"))
@@ -261,9 +262,10 @@ class KlineBot:
                                        logger=self.log)
         self.executor_changed_ts = float(settings.get("executor_changed_ts") or 0.0)
 
-        backend, self._store_desc = backend_from_env(self.log)
+        # Upstash desactivado por ahora: solo copia local (backend=None).
+        self._store_desc = f"solo disco local ({RECOVERY_FILE})"
         self.store = StateStore(
-            backend, RECOVERY_FILE, make_owner_id(),
+            None, RECOVERY_FILE, make_owner_id(),
             build_doc=self._recovery_doc, log=self.log, on_fenced=self._on_fenced,
             key_prefix=STATE_KEY_PREFIX, max_trades=STATE_TRADES_MAX,
         )
@@ -353,8 +355,7 @@ class KlineBot:
         if await asyncio.to_thread(self.store.acquired.wait, STATE_BOOT_WAIT_S):
             self._restore_from_store()
         else:
-            self.log("[estado] ⚠️ Aún no controlo el estado (otra instancia activa o Upstash "
-                     "no responde): sin entradas ni cierres hasta recuperarlo")
+            self.log("[estado] ⚠️ Aún no recupero el estado local: sin entradas ni cierres hasta recuperarlo")
 
         self.price_cache = SymbolWebSocketPriceCache(list(self.positions))
         self.price_cache.set_update_callback(self._on_price_event)
