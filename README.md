@@ -1,84 +1,84 @@
-# Bot Trading Riesgo - Shorts a ganadores de Binance Futures
+# BOTKLINE · velas 1m que siguen la tendencia (Binance USDⓈ-M Futures)
 
-Aplicación web lista para Render que monitorea los ganadores de Binance USDT-M Futures y abre tramos **short** cuando un símbolo supera niveles de ganancia de 24h.
+Aplicación web para Render que vigila las velas de 1 minuto de **todos** los perpetuos USDT por WebSocket y manda señales de apertura y cierre al **Executor** externo, que es quien abre las órdenes en Binance.
 
-## Estrategia implementada
+## Estrategia
 
-- **Casi sin REST** (para evitar baneos de IP de Binance):
-  - La única petición REST de datos es `exchangeInfo`, una vez al arrancar, y se guarda en disco. Si el caché tiene menos de `SYMBOL_REFRESH_HOURS`, el arranque no hace ninguna. Puede ir por un proxy (`REST_PROXY_URL`); si el proxy falla se reintenta una vez por la IP directa.
-  - No se consulta ni se cambia el leverage: se usa el que ya tenga la cuenta.
-  - REST solo se usa además para enviar órdenes reales (`PAPER_MODE=false` y `LIVE_TRADING=true`).
-- Precios, cambio 24h y volumen por WebSocket (`!ticker@arr`, `!markPrice@arr`, `<symbol>@bookTicker`).
-- Velas de **todos** los símbolos solo por WebSocket (`kline_ws.py`), sin backfill REST:
-  - **Una conexión por intervalo** (`KLINE_INTERVALS`, por defecto `1m`) con todos los símbolos suscritos (Binance admite 1024 streams por conexión).
-  - Se guardan las últimas `KLINE_HISTORY` velas cerradas por símbolo en un buffer circular de numpy: 48 bytes por vela en `float64` (28 en `float32`), frente a ~300 bytes con objetos Python. Con 819 símbolos y 1500 velas son ~60 MB por intervalo (~35 MB en `float32`).
-  - Las velas en formación se descartan sin parsear el JSON; solo se procesa el cierre.
-  - La confirmación de entrada exige que la vela 1m del minuto anterior haya cerrado alcista.
-- Abre short en tramos configurables cuando el cambio 24h supera estos niveles:
-  - `50%, 75%, 100%, 150%, 200%, 250%`
-- Tamaño de cada tramo:
-  - `5, 5, 10, 20, 40, 80 USDT`
-- Cierra toda la posición cuando la ganancia no realizada llega al 50% del capital colocado:
-  - Ejemplo: posición de `5 USDT` -> cierre con `2.5 USDT` de ganancia.
-- Muestra en una página web:
-  - Ganadores detectados.
-  - Posiciones abiertas.
-  - PnL no realizado.
-  - Operaciones cerradas.
-  - Eventos del bot.
+1. **Velas por WebSocket** (`kline_ws.py`): una conexión con `<símbolo>@kline_1m` de todos los perpetuos. Se guardan las dos últimas velas cerradas de cada símbolo. Sin REST.
+2. **Señal**: al cerrar cada vela se mide su cuerpo, `(cierre − apertura) / apertura`.
+   - Sube **≥ 3 %** → abre **LONG**.
+   - Baja **≥ 3 %** → abre **SHORT**.
+3. **Tamaño**: notional fijo de **5 USDT**. La cantidad se redondea hacia arriba al `stepSize` del par para no quedar por debajo del mínimo de Binance. Los pares que exigen más de 5 USDT, o cuyo `stepSize` obliga a más de 1,5× el notional, se saltan y quedan anotados en la tabla de señales.
+4. **Una posición por símbolo**: mientras esté abierta, las señales nuevas de ese símbolo se ignoran.
+5. **Salida**: se cierra cuando el precio avanza **2 % o más** a favor desde la entrada (precio en tiempo real de `WS.py`: bookTicker del símbolo + `!markPrice@arr`). **No hay stop loss**; solo cierre manual desde la web.
 
-## Seguridad
+Las cifras son configurables con variables de entorno (tabla abajo).
 
-El bot arranca por defecto en **PAPER_MODE=true**, por lo que simula las órdenes y no envía operaciones reales.
+## Executor
 
-Para operar real en Binance Futures debes configurar todas estas variables de entorno:
+Cada apertura y cierre se manda con `POST <EXECUTOR_URL>/signal` y la cabecera `X-Signal-Secret`, con el mismo formato de antes:
 
-```bash
-PAPER_MODE=false
-LIVE_TRADING=true
-BINANCE_API_KEY=tu_api_key
-BINANCE_API_SECRET=tu_api_secret
+```json
+{"action": "open",  "trade_id": 1791908572, "symbol": "FOOUSDT", "direction": "LONG",
+ "price": 1.04, "quantity": 5, "notional": 5.2, "level": 4.0}
+{"action": "close", "trade_id": 1791908572, "symbol": "FOOUSDT", "direction": "LONG",
+ "reason": "TP", "close_price": 1.0609, "pnl": 0.1045}
 ```
 
-> Usa primero paper trading. Un short contra monedas que suben 100%-250% puede liquidarse si no hay control de margen, apalancamiento y pérdidas.
+`direction` ahora puede ser `LONG` o `SHORT`, y `level` lleva el % del cuerpo de la vela que disparó la señal.
 
-## Variables de entorno principales
+### Cambiar el link en caliente
+
+- **Web**: bloque *Executor* → pegar el link nuevo (y el secreto si cambia) → *Cambiar link*. La web avisa si el executor nuevo responde.
+- **API**:
+
+  ```bash
+  curl -X POST https://<bot>/api/executor -H 'Content-Type: application/json' \
+       -d '{"url": "https://nuevo-executor.onrender.com", "secret": "opcional"}'
+  ```
+
+  `url` vacío deja de mandar señales. Si `ADMIN_TOKEN` está definido, añade `-H 'X-Admin-Token: <token>'`.
+
+El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco local (`SETTINGS_FILE`). En Render free ese disco se borra al reiniciar, así que tras un redeploy vuelve a `EXECUTOR_URL`. Los cierres de posiciones ya abiertas van al link vigente en el momento del cierre.
+
+## Variables de entorno
 
 | Variable | Default | Descripción |
 | --- | --- | --- |
-| `PAPER_MODE` | `true` | Simula órdenes si está en `true`. |
-| `LIVE_TRADING` | `false` | Habilita órdenes reales si también `PAPER_MODE=false`. |
-| `ENTRY_LEVELS` | `50,75,100,150,200,250` | Niveles de subida 24h para abrir tramos. |
-| `ENTRY_NOTIONALS` | `5,5,10,20,40,80` | USDT por tramo. |
-| `TAKE_PROFIT_FRACTION` | `0.5` | Ganancia objetivo sobre el notional total. |
-| `SCAN_INTERVAL_SECONDS` | `60` | Frecuencia mínima de consulta REST para refrescar ganadores y actualizar la lista seguida por WebSocket. |
-| `MAX_SYMBOLS` | `120` | Máximo de ganadores a evaluar por escaneo. |
-| `MIN_GAIN_TO_SHOW` | `0` | Filtro mínimo de porcentaje para mostrar ganadores en la tabla. |
-| `INCLUDE_SPOT_WINNERS` | `false` | Conservado solo para el fallback manual REST; el escaneo operativo usa futures por WebSocket. |
-| `REST_PROXY_URL` | vacío | Proxy HTTP para la única petición REST del arranque (`exchangeInfo`). Configúralo como secreto. |
-| `SYMBOL_REFRESH_HOURS` | `12` | Antigüedad máxima del caché de `exchangeInfo` en disco antes de volver a pedirlo al arrancar. |
-| `KLINE_INTERVALS` | `1m` | Intervalos de velas, separados por comas. Cada uno es una conexión WebSocket. `1m` siempre se incluye. |
-| `KLINE_HISTORY` | `2` | Velas cerradas guardadas por símbolo e intervalo. |
-| `KLINE_DTYPE` | `float64` | `float32` usa la mitad de RAM a cambio de precisión. |
-| `KLINE_WS_COMPRESSION` | `false` | Compresión deflate en las conexiones de velas (menos tráfico, más CPU). |
-| `KLINE_ALLOW_NO_DATA` | `false` | Si es `true`, permite entrar cuando aún no hay vela cerrada reciente. |
-| `KLINE_STREAMS_PER_CONN` | `1024` | Máximo de símbolos por conexión; solo si se supera se abre otra para el mismo intervalo. |
-| `STATE_FILE` | `/tmp/bottradingriesgo_state.json` | Archivo usado para compartir el último estado útil entre reinicios/workers. |
+| `SIGNAL_THRESHOLD_PCT` | `3` | Cuerpo mínimo de la vela 1m para abrir. |
+| `TAKE_PROFIT_PCT` | `2` | Avance a favor para cerrar. |
+| `NOTIONAL_USDT` | `5` | USDT por entrada. |
+| `MAX_NOTIONAL_OVER` | `1.5` | Si el redondeo al `stepSize` supera notional × esto, se salta el par. |
+| `COOLDOWN_SECONDS` | `0` | Pausa tras un cierre antes de volver a operar el símbolo. |
+| `SIGNAL_MAX_DELAY_S` | `10` | Un cierre de vela que llega más tarde que esto no genera señal. |
+| `PRICE_MAX_AGE_S` | `5` | Antigüedad máxima del precio usado para el TP. |
+| `EXECUTOR_URL` | `https://executor-5lu0.onrender.com` | Link inicial del Executor (se puede cambiar desde la web). |
+| `EXECUTOR_SECRET` | `clave-secreta-aleatoria` | Valor de `X-Signal-Secret`. |
+| `ADMIN_TOKEN` | vacío | Si se define, cambiar el executor y cerrar desde la web lo exige. |
+| `KLINE_HISTORY` | `2` | Velas cerradas guardadas por símbolo. |
+| `REST_PROXY_URL` | — | Proxy para la única petición REST (`exchangeInfo`, al arrancar). |
+| `SYMBOL_REFRESH_HOURS` | `12` | Antigüedad máxima del caché de `exchangeInfo` en disco. |
+| `RECOVERY_FILE` | `/tmp/botkline_recovery.json` | Copia local de posiciones abiertas e historial. Upstash está desactivado por ahora: en Render free las posiciones abiertas se pierden al reiniciar. |
+
+## Endpoints
+
+| Ruta | Uso |
+| --- | --- |
+| `GET /` | Panel: posiciones, señales recientes, cierres, eventos y link del executor. |
+| `GET /api/status` | Estado completo en JSON. |
+| `GET/POST /api/executor` | Ver o cambiar el link del Executor. |
+| `POST /api/close/<SÍMBOLO>` | Cierre manual. |
+| `GET /api/trades` | Historial de cierres. |
+| `GET /health`, `GET /api/recovery` | Diagnóstico. |
 
 ## Ejecutar local
 
 ```bash
 pip install -r requirements.txt
-python app.py
+python app.py          # http://localhost:8000
+python -m pytest tests
 ```
-
-Abre `http://localhost:8000`.
-
-## Diagnóstico de pantalla vacía
-
-Si el bot abre posiciones en los logs pero la página no las muestra, revisa en la web el bloque **Estado API crudo**. La página ahora renderiza un snapshot inicial del servidor y luego refresca `/api/status`; si falla JavaScript, fetch o el endpoint, el error queda visible en **Último error / diagnóstico**.
 
 ## Deploy en Render
 
-El archivo `render.yaml` incluye el servicio web y fija `PYTHON_VERSION=3.12.13` para evitar que Render use Python 3.14, donde dependencias con extensiones nativas pueden compilar desde fuente y fallar. En Render configura las variables de entorno necesarias y despliega el repositorio.
-
+`render.yaml` define el servicio y las variables. El código de la estrategia está en `strategy.py` (funciones puras, con pruebas en `tests/test_strategy.py`) y el bot en `app.py`.
