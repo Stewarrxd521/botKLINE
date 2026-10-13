@@ -97,6 +97,9 @@ STATE_BOOT_WAIT_S = float(os.getenv("STATE_BOOT_WAIT_S", "20"))
 STATE_PERSIST_SECS = float(os.getenv("STATE_PERSIST_SECS", "30"))
 SHUTDOWN_DRAIN_S  = 5.0
 
+EVAL_MINUTES_KEPT = int(os.getenv("EVAL_MINUTES_KEPT", "30"))   # minutos de evaluaciones en la web
+EVAL_TOP_N        = int(os.getenv("EVAL_TOP_N", "15"))          # mayores cuerpos mostrados
+
 STATUS_POLL_MS = int(os.getenv("STATUS_POLL_MS", "1500"))
 
 
@@ -261,6 +264,15 @@ class KlineBot:
                                        settings.get("executor_secret", EXECUTOR_SECRET),
                                        logger=self.log)
         self.executor_changed_ts = float(settings.get("executor_changed_ts") or 0.0)
+        # Parámetros editables en caliente desde la web (POST /api/config).
+        self.threshold_pct = float(settings.get("threshold_pct") or SIGNAL_THRESHOLD_PCT)
+        self.tp_pct = float(settings.get("tp_pct") or TAKE_PROFIT_PCT)
+
+        # Evaluaciones: cada cierre de vela 1m se mide, pase o no el umbral.
+        # minuto (open_time ms) → [(cuerpo %, símbolo, apertura, cierre), ...]
+        self._evals: Dict[int, List[Tuple[float, str, float, float]]] = {}
+        self._evals_lock = threading.Lock()
+        self.eval_count = 0
 
         # Upstash desactivado por ahora: solo copia local (backend=None).
         self._store_desc = f"solo disco local ({RECOVERY_FILE})"
@@ -303,7 +315,8 @@ class KlineBot:
     def _save_settings(self) -> None:
         t = self.executor.target
         data = {"executor_url": t.url, "executor_secret": t.secret,
-                "executor_changed_ts": self.executor_changed_ts}
+                "executor_changed_ts": self.executor_changed_ts,
+                "threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -311,6 +324,28 @@ class KlineBot:
             os.replace(tmp, SETTINGS_FILE)
         except Exception as exc:
             self.log(f"No pude guardar ajustes locales: {exc}")
+
+    def set_config(self, threshold_pct: Optional[float] = None,
+                   tp_pct: Optional[float] = None) -> dict:
+        """Cambia en caliente el % de la señal y/o el % del TP. El umbral aplica
+        a la siguiente vela; el TP también a las posiciones ya abiertas."""
+        changes = []
+        if threshold_pct is not None and threshold_pct != self.threshold_pct:
+            changes.append(f"señal {self.threshold_pct:g}% → {threshold_pct:g}%")
+            self.threshold_pct = threshold_pct
+        if tp_pct is not None and tp_pct != self.tp_pct:
+            changes.append(f"TP {self.tp_pct:g}% → {tp_pct:g}%")
+            self.tp_pct = tp_pct
+            with self.lock:
+                for p in self.positions.values():
+                    p.tp_price = strategy.take_profit_price(p.entry_price, p.direction, tp_pct)
+            for sym in list(self._pos_syms):
+                self._on_price_event(sym, "config")      # revisa ya el TP nuevo
+        if changes:
+            self._save_settings()
+            self.store.mark_dirty(True)
+            self.log("[config] " + " | ".join(changes))
+        return {"threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct}
 
     def set_executor(self, url: str, secret: Optional[str] = None) -> ExecutorTarget:
         """Cambia el destino de las señales en caliente (sin reiniciar)."""
@@ -344,8 +379,8 @@ class KlineBot:
             self.log(f"Bot detenido por error no controlado: {exc!r}")
 
     async def _main(self) -> None:
-        self.log(f"Bot iniciado | señal: cuerpo vela 1m ≥ {SIGNAL_THRESHOLD_PCT:g}% | "
-                 f"TP {TAKE_PROFIT_PCT:g}% | {NOTIONAL_USDT:g} USDT | sin stop loss | "
+        self.log(f"Bot iniciado | señal: cuerpo vela 1m ≥ {self.threshold_pct:g}% | "
+                 f"TP {self.tp_pct:g}% | {NOTIONAL_USDT:g} USDT | sin stop loss | "
                  f"executor → {self.executor.target.url or '(vacío)'}")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
@@ -468,12 +503,49 @@ class KlineBot:
 
     def _on_kline_close(self, symbol: str, interval: str, candle: Candle) -> None:
         """Debe ser instantáneo: solo filtra y pasa la señal al loop del bot."""
-        direction = strategy.signal_direction(candle.open, candle.close, SIGNAL_THRESHOLD_PCT)
+        self._record_eval(symbol, candle)
+        direction = strategy.signal_direction(candle.open, candle.close, self.threshold_pct)
         if direction is None:
             return
         loop = self.loop
         if loop is not None:
             loop.call_soon_threadsafe(self._handle_signal, symbol, direction, candle, time.time())
+
+    def _record_eval(self, symbol: str, candle: Candle) -> None:
+        body = strategy.body_change_pct(candle.open, candle.close)
+        with self._evals_lock:
+            self.eval_count += 1
+            rows = self._evals.get(candle.open_time)
+            if rows is None:
+                rows = self._evals[candle.open_time] = []
+                for old in sorted(self._evals)[:-EVAL_MINUTES_KEPT]:
+                    del self._evals[old]
+            rows.append((body, symbol, candle.open, candle.close))
+
+    def evaluations(self) -> dict:
+        """Resumen por minuto y los mayores cuerpos del último minuto cerrado."""
+        thr = self.threshold_pct
+        with self._evals_lock:
+            buckets = [(t, list(rows)) for t, rows in sorted(self._evals.items(), reverse=True)]
+        minutes = []
+        for t, rows in buckets:
+            bodies = [r[0] for r in rows]
+            minutes.append({
+                "minute":  _utc(t / 1000, "%H:%M"),
+                "evaluated": len(rows),
+                "long":    sum(1 for b in bodies if b >= thr),
+                "short":   sum(1 for b in bodies if b <= -thr),
+                "max_up":  max(bodies) if bodies else 0.0,
+                "max_down": min(bodies) if bodies else 0.0,
+            })
+        top = []
+        if buckets:
+            t, rows = buckets[0]
+            for body, sym, o, c in sorted(rows, key=lambda r: abs(r[0]), reverse=True)[:EVAL_TOP_N]:
+                top.append({"symbol": sym, "body_pct": body, "open": o, "close": c,
+                            "signal": strategy.signal_direction(o, c, thr) or ""})
+        return {"total": self.eval_count, "minutes": minutes, "top": top,
+                "top_minute": minutes[0]["minute"] if minutes else ""}
 
     def _record_signal(self, symbol: str, direction: str, candle: Candle, action: str) -> None:
         with self.lock:
@@ -530,7 +602,7 @@ class KlineBot:
         pos = Position(
             trade_id=self._next_trade_id(), symbol=symbol, direction=direction,
             entry_price=price, qty=qty, notional=eff,
-            tp_price=strategy.take_profit_price(price, direction, TAKE_PROFIT_PCT),
+            tp_price=strategy.take_profit_price(price, direction, self.tp_pct),
             signal_pct=body, candle_open=candle.open, candle_close=candle.close,
             candle_time=candle.open_time, last_price=price,
         )
@@ -599,7 +671,7 @@ class KlineBot:
             if pos is None:
                 return
             pos.update(price)
-            hit = strategy.take_profit_hit(price, pos.entry_price, pos.direction, TAKE_PROFIT_PCT)
+            hit = (price >= pos.tp_price) if pos.direction == strategy.LONG else (price <= pos.tp_price)
         if hit and self.store.can_act():
             self._close(symbol, price, "TP")
 
@@ -773,7 +845,7 @@ class KlineBot:
             "running":         self.running,
             "uptime_s":        now - self.started_at,
             "config": {
-                "threshold_pct": SIGNAL_THRESHOLD_PCT, "tp_pct": TAKE_PROFIT_PCT,
+                "threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct,
                 "notional": NOTIONAL_USDT, "stop_loss": None, "cooldown_s": COOLDOWN_SECONDS,
                 "admin_token": bool(ADMIN_TOKEN),
             },
@@ -799,6 +871,7 @@ class KlineBot:
             "closed_trades":   closed,
             "signals":         signals,
             "events":          events,
+            "evaluations":     self.evaluations(),
             "last_error":      self.last_error,
             "persistence":     self.store.status(),
         }
@@ -866,6 +939,35 @@ def api_executor_set():
     target = bot.set_executor(url, secret)
     reachable, detail = bot.executor.probe(url) if url else (False, "sin URL: señales desactivadas")
     return jsonify({"ok": True, "url": target.url, "reachable": reachable, "detail": detail})
+
+
+@app.get("/api/config")
+def api_config_get():
+    return _no_store(jsonify({"ok": True, "threshold_pct": bot.threshold_pct, "tp_pct": bot.tp_pct}))
+
+
+@app.post("/api/config")
+def api_config_set():
+    """Cambia en caliente el % de la señal y/o del TP. Body JSON:
+    {"threshold_pct": 3, "tp_pct": 2, "token": "si hay ADMIN_TOKEN"}."""
+    busy = _guard()
+    if busy:
+        return busy
+    data = request.get_json(silent=True) or {}
+    vals = {}
+    for key in ("threshold_pct", "tp_pct"):
+        if data.get(key) in (None, ""):
+            continue
+        try:
+            v = float(data[key])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": f"{key} inválido"}), 400
+        if not 0 < v <= 100:
+            return jsonify({"ok": False, "error": f"{key} debe estar entre 0 y 100"}), 400
+        vals[key] = v
+    if not vals:
+        return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
+    return jsonify({"ok": True, **bot.set_config(**vals)})
 
 
 @app.post("/api/close/<symbol>")
@@ -957,6 +1059,7 @@ HTML = r"""<!doctype html>
 
   <div class="grid">
     <div class="card stat"><div class="label">Velas 1m</div><div class="v" id="sKl">—</div></div>
+    <div class="card stat"><div class="label">Velas evaluadas</div><div class="v" id="sEval">—</div></div>
     <div class="card stat"><div class="label">Señales / abiertas</div><div class="v" id="sSig">—</div></div>
     <div class="card stat"><div class="label">Posiciones abiertas</div><div class="v" id="sPos">—</div></div>
     <div class="card stat"><div class="label">PnL abierto</div><div class="v" id="sUpnl">—</div></div>
@@ -976,6 +1079,17 @@ HTML = r"""<!doctype html>
     <div id="exMsg" class="muted"></div>
   </div>
 
+  <div class="card">
+    <h2>Parámetros (en caliente)</h2>
+    <div class="muted">Señal actual: <b id="cfgThr">—</b> · TP actual: <b id="cfgTp">—</b></div>
+    <form id="cfgForm" style="margin-top:10px">
+      <input id="cfgNewThr" type="number" step="0.01" min="0.01" max="100" placeholder="% cuerpo de vela para entrar (ej. 3)">
+      <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (ej. 2)">
+      <button type="submit">Guardar</button>
+    </form>
+    <div id="cfgMsg" class="muted" style="margin-top:8px;min-height:18px"></div>
+  </div>
+
   <div class="card"><h2>Posiciones abiertas</h2><div class="scroll"><table>
     <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>TP</th><th>Notional</th><th>PnL</th><th>Abierta</th><th></th></tr></thead>
     <tbody id="tPos"></tbody></table></div></div>
@@ -983,6 +1097,14 @@ HTML = r"""<!doctype html>
   <div class="card"><h2>Señales recientes</h2><div class="scroll"><table>
     <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Cuerpo</th><th>Acción</th></tr></thead>
     <tbody id="tSig"></tbody></table></div></div>
+
+  <div class="card"><h2>Evaluaciones · mayores cuerpos de la vela <span id="evMin"></span></h2><div class="scroll"><table>
+    <thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Cuerpo</th><th>Señal</th></tr></thead>
+    <tbody id="tTop"></tbody></table></div></div>
+
+  <div class="card"><h2>Evaluaciones por minuto</h2><div class="scroll"><table>
+    <thead><tr><th>Vela</th><th>Evaluadas</th><th>≥ umbral (LONG)</th><th>≤ −umbral (SHORT)</th><th>Mayor subida</th><th>Mayor caída</th></tr></thead>
+    <tbody id="tMin"></tbody></table></div></div>
 
   <div class="card"><h2>Operaciones cerradas</h2><div class="scroll"><table>
     <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL</th><th>Duración</th><th>Motivo</th></tr></thead>
@@ -1018,6 +1140,17 @@ async function refresh() {
   q('exToken').style.display = c.admin_token ? '' : 'none';
   const k = d.klines;
   q('sKl').innerHTML = `${k.with_data}/${k.symbols} <span class="muted" style="font-size:12px">${k.active}/${k.connections} conex.</span>`;
+  const ev = d.evaluations;
+  q('sEval').textContent = ev.total.toLocaleString('es');
+  q('cfgThr').textContent = `±${c.threshold_pct}%`;
+  q('cfgTp').textContent = `${c.tp_pct}%`;
+  q('evMin').textContent = ev.top_minute;
+  q('tTop').innerHTML = ev.top.map(r => `<tr><td>${esc(r.symbol)}</td><td>${num(r.open, 8)}</td><td>${num(r.close, 8)}</td>
+    <td>${pct(r.body_pct)}</td><td>${r.signal ? tag(r.signal) : '<span class="muted">—</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Esperando el primer cierre de vela</td></tr>';
+  q('tMin').innerHTML = ev.minutes.map(m => `<tr><td>${esc(m.minute)}</td><td>${m.evaluated}</td><td>${m.long}</td><td>${m.short}</td>
+    <td>${pct(m.max_up)}</td><td>${pct(m.max_down)}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="muted">Sin evaluaciones todavía</td></tr>';
   q('sSig').textContent = `${d.signal_count} / ${d.opened_count}`;
   q('sPos').textContent = d.positions.length;
   q('sUpnl').innerHTML = usd(d.unrealized_pnl);
@@ -1064,6 +1197,21 @@ q('exForm').addEventListener('submit', async ev => {
       : `<span class="neg">${esc(r.error)}</span>`;
     if (r.ok) { q('exNew').value = ''; q('exSecret').value = ''; }
   } catch (e) { q('exMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  refresh();
+});
+
+q('cfgForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const body = {threshold_pct: q('cfgNewThr').value, tp_pct: q('cfgNewTp').value};
+  try { localStorage.setItem('botkline_token', q('exToken').value.trim()); } catch (e) {}
+  q('cfgMsg').textContent = 'Guardando…';
+  try {
+    const r = await (await fetch('/api/config', {method: 'POST', headers: headers(), body: JSON.stringify(body)})).json();
+    q('cfgMsg').innerHTML = r.ok
+      ? `<span class="pos">Guardado.</span> Señal ±${r.threshold_pct}% · TP ${r.tp_pct}%`
+      : `<span class="neg">${esc(r.error)}</span>`;
+    if (r.ok) { q('cfgNewThr').value = ''; q('cfgNewTp').value = ''; }
+  } catch (e) { q('cfgMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
   refresh();
 });
 

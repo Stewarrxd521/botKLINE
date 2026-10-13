@@ -12,7 +12,13 @@ Aplicación web para Render que vigila las velas de 1 minuto de **todos** los pe
 4. **Una posición por símbolo**: mientras esté abierta, las señales nuevas de ese símbolo se ignoran.
 5. **Salida**: se cierra cuando el precio avanza **2 % o más** a favor desde la entrada (precio en tiempo real de `WS.py`: bookTicker del símbolo + `!markPrice@arr`). **No hay stop loss**; solo cierre manual desde la web.
 
-Las cifras son configurables con variables de entorno (tabla abajo).
+Las cifras se configuran con variables de entorno (tabla abajo). El **% de la señal** y el **% del TP** también se cambian en caliente desde el bloque *Parámetros* de la web o con `POST /api/config` (`{"threshold_pct": 3, "tp_pct": 2}`). El umbral aplica desde la siguiente vela; el TP nuevo también se aplica a las posiciones abiertas. Los valores se guardan en `SETTINGS_FILE`.
+
+### Evaluaciones
+
+La web muestra todas las velas evaluadas, no solo las que generan señal:
+- **Mayores cuerpos** de la última vela 1m cerrada (los `EVAL_TOP_N` primeros, por defecto 15), con la señal que daría con el umbral actual.
+- **Resumen por minuto** (últimos `EVAL_MINUTES_KEPT`, por defecto 30): velas evaluadas, cuántas pasaron el umbral en cada dirección y la mayor subida y caída.
 
 ## Executor
 
@@ -67,6 +73,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `GET /` | Panel: posiciones, señales recientes, cierres, eventos y link del executor. |
 | `GET /api/status` | Estado completo en JSON. |
 | `GET/POST /api/executor` | Ver o cambiar el link del Executor. |
+| `GET/POST /api/config` | Ver o cambiar el % de la señal y del TP. |
 | `POST /api/close/<SÍMBOLO>` | Cierre manual. |
 | `GET /api/trades` | Historial de cierres. |
 | `GET /health`, `GET /api/recovery` | Diagnóstico. |
