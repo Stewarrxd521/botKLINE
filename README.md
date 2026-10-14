@@ -14,6 +14,14 @@ Aplicación web para Render que vigila las velas de 1 minuto de **todos** los pe
 
 Las cifras se configuran con variables de entorno (tabla abajo). El **% de la señal** y el **% del TP** también se cambian en caliente desde el bloque *Parámetros* de la web o con `POST /api/config` (`{"threshold_pct": 3, "tp_pct": 2}`). El umbral aplica desde la siguiente vela; el TP nuevo también se aplica a las posiciones abiertas. Los valores se guardan en `SETTINGS_FILE`.
 
+### Bloquear longs o shorts
+
+En el bloque *Parámetros* hay un botón por dirección (o `POST /api/block` con `{"direction": "LONG", "blocked": true}`). Una dirección bloqueada no abre entradas nuevas; sus señales aparecen como *bloqueada* en la tabla de señales. Las posiciones ya abiertas siguen hasta su TP o cierre manual. El estado se guarda en `SETTINGS_FILE`.
+
+### MFE / MAE
+
+Cada posición registra su máximo a favor (**MFE**) y su máximo en contra (**MAE**), en % y en USDT, con el momento en que se marcaron y el precio máximo y mínimo vistos. La web los muestra en las posiciones abiertas y en las cerradas, más un resumen (medias, mejor MFE, peor MAE, tiempo hasta el MAE) total y por dirección. `GET /api/trades.csv` descarga el historial completo con estas columnas.
+
 ### Evaluaciones
 
 La web muestra todas las velas evaluadas, no solo las que generan señal:
@@ -80,6 +88,8 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `GET/POST /api/config` | Ver o cambiar el % de la señal y del TP. |
 | `POST /api/close/<SÍMBOLO>` | Cierre manual. |
 | `GET /api/trades` | Historial de cierres. |
+| `GET /api/trades.csv` | Historial con MFE/MAE en CSV. |
+| `POST /api/block` | Bloquear o permitir LONG o SHORT. |
 | `GET /health`, `GET /api/recovery` | Diagnóstico. |
 
 ## Ejecutar local
