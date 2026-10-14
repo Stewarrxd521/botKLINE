@@ -7,8 +7,9 @@ Estrategia
   • Al cerrar cada vela se mide su cuerpo: (cierre - apertura) / apertura.
       ≥ +SIGNAL_THRESHOLD_PCT (3 %)  → abre LONG
       ≤ -SIGNAL_THRESHOLD_PCT (-3 %) → abre SHORT
-  • Cada entrada usa un notional fijo de NOTIONAL_USDT (5 USDT). Una sola
-    posición por símbolo: mientras esté abierta se ignoran nuevas señales.
+  • Cada entrada usa un notional fijo de NOTIONAL_USDT (5 USDT). Cada señal
+    abre su propia posición aunque ya haya otras en el par, en cualquier
+    dirección (se identifican por trade_id).
   • Cierre cuando el precio avanza TAKE_PROFIT_PCT (2 %) o más a favor desde
     la entrada. SIN stop loss (solo cierre manual desde la web).
   • Las órdenes NO salen de aquí: se mandan como señales al Executor externo
@@ -330,7 +331,8 @@ class Position:
 class KlineBot:
     def __init__(self) -> None:
         self.lock = threading.RLock()
-        self.positions: Dict[str, Position] = {}
+        # trade_id → posición. Puede haber varias por símbolo y en ambas direcciones.
+        self.positions: Dict[int, Position] = {}
         self.closed_trades: List[dict] = []
         self.signals: Deque[dict] = deque(maxlen=200)
         self.events: Deque[str] = deque(maxlen=200)
@@ -405,7 +407,7 @@ class KlineBot:
 
     def _refresh_pos_syms(self) -> None:
         with self.lock:
-            self._pos_syms = frozenset(self.positions)
+            self._pos_syms = frozenset(p.symbol for p in self.positions.values())
 
     # ── Ajustes locales (link del executor) ───────────────────────────────────
 
@@ -509,7 +511,7 @@ class KlineBot:
         else:
             self.log("[estado] ⚠️ Aún no recupero el estado local: sin entradas ni cierres hasta recuperarlo")
 
-        self.price_cache = SymbolWebSocketPriceCache(list(self.positions))
+        self.price_cache = SymbolWebSocketPriceCache(sorted(self._pos_syms))
         self.price_cache.set_update_callback(self._on_price_event)
         self.price_cache.start()
 
@@ -701,11 +703,9 @@ class KlineBot:
         if not self.store.can_open():
             self._record_signal(symbol, direction, candle, "ignorada: estado sin confirmar")
             return
+        # Sin límite por símbolo: cada señal abre su propia posición aunque ya
+        # haya otras abiertas en ese par, en la misma o en la otra dirección.
         with self.lock:
-            if symbol in self.positions:
-                held = self.positions[symbol].direction
-                self._record_signal(symbol, direction, candle, f"ignorada: ya hay {held} abierto")
-                return
             until = self.cooldown.get(symbol, 0.0)
         if until > time.time():
             self._record_signal(symbol, direction, candle, "ignorada: en pausa tras cierre")
@@ -731,7 +731,7 @@ class KlineBot:
             candle_time=candle.open_time, last_price=price,
         )
         with self.lock:
-            self.positions[symbol] = pos
+            self.positions[pos.trade_id] = pos
             self.opened_count += 1
         self._refresh_pos_syms()
         if self.price_cache is not None:
@@ -789,27 +789,32 @@ class KlineBot:
         return pc.get_price(symbol, max_age_s=PRICE_MAX_AGE_S)
 
     def _check_take_profit(self, symbol: str) -> None:
+        """Revisa el TP de TODAS las posiciones abiertas del símbolo."""
         price = self._price(symbol)
         if not price:
             return
+        hits = []
         with self.lock:
-            pos = self.positions.get(symbol)
-            if pos is None:
-                return
-            pos.update(price)
-            hit = (price >= pos.tp_price) if pos.direction == strategy.LONG else (price <= pos.tp_price)
-        if hit and self.store.can_act():
-            self._close(symbol, price, "TP")
+            for tid, pos in self.positions.items():
+                if pos.symbol != symbol:
+                    continue
+                pos.update(price)
+                if (price >= pos.tp_price) if pos.direction == strategy.LONG else (price <= pos.tp_price):
+                    hits.append(tid)
+        if hits and self.store.can_act():
+            for tid in hits:
+                self._close(tid, price, "TP")
 
-    def _close(self, symbol: str, price: float, reason: str) -> bool:
+    def _close(self, trade_id: int, price: float, reason: str) -> bool:
         with self.lock:
-            pos = self.positions.get(symbol)
-            if pos is None or symbol in self._closing:
+            pos = self.positions.get(trade_id)
+            if pos is None or trade_id in self._closing:
                 return False
-            self._closing.add(symbol)
+            self._closing.add(trade_id)
+        symbol = pos.symbol
         try:
             with self.lock:
-                pos = self.positions.pop(symbol, None)
+                pos = self.positions.pop(trade_id, None)
                 if pos is None:
                     return False
                 pos.update(price)
@@ -850,18 +855,27 @@ class KlineBot:
             return True
         finally:
             with self.lock:
-                self._closing.discard(symbol)
+                self._closing.discard(trade_id)
 
-    def close_manual(self, symbol: str) -> Tuple[bool, str]:
-        """Cierre manual desde la web (corre en el loop del bot)."""
+    def close_manual(self, ref: str) -> Tuple[bool, str]:
+        """Cierre manual desde la web (corre en el loop del bot). `ref` es un
+        trade_id (cierra esa posición) o un símbolo (cierra todas las de ese par)."""
         with self.lock:
-            pos = self.positions.get(symbol)
-        if pos is None:
-            return False, "No hay posición abierta en ese símbolo"
-        price = self._price(symbol) or (self.price_cache.get_mark_price(symbol) if self.price_cache else None) \
-            or pos.last_price or pos.entry_price
-        ok = self._close(symbol, price, "MANUAL")
-        return ok, "Posición cerrada" if ok else "No se pudo cerrar (ya se estaba cerrando)"
+            if ref.isdigit():
+                targets = [p for t, p in self.positions.items() if t == int(ref)]
+            else:
+                targets = [p for p in self.positions.values() if p.symbol == ref.upper()]
+        if not targets:
+            return False, "No hay posición abierta con ese trade o símbolo"
+        closed = 0
+        for pos in targets:
+            sym = pos.symbol
+            price = self._price(sym) or (self.price_cache.get_mark_price(sym) if self.price_cache else None) \
+                or pos.last_price or pos.entry_price
+            closed += self._close(pos.trade_id, price, "MANUAL")
+        if not closed:
+            return False, "No se pudo cerrar (ya se estaba cerrando)"
+        return True, f"{closed} posición(es) cerrada(s)"
 
     # ── Mantenimiento ─────────────────────────────────────────────────────────
 
@@ -890,7 +904,7 @@ class KlineBot:
                 "v": 2,
                 "trade_id_seq": self.trade_id_seq,
                 "total_realized_pnl": self.total_realized_pnl,
-                "positions": {s: asdict(p) for s, p in self.positions.items()},
+                "positions": {str(t): asdict(p) for t, p in self.positions.items()},
                 "cooldowns": {s: t for s, t in self.cooldown.items() if t > now},
             }
             trades = self.store.peek_trades()
@@ -907,11 +921,11 @@ class KlineBot:
         doc, trades, source = r
         doc = doc or {}
         names = {f.name for f in fields(Position)}
-        positions: Dict[str, Position] = {}
+        positions: Dict[int, Position] = {}
         for sym, d in (doc.get("positions") or {}).items():
             try:
                 pos = Position(**{k: v for k, v in d.items() if k in names})
-                positions[pos.symbol] = pos
+                positions[pos.trade_id] = pos
             except Exception as exc:
                 self.log(f"[estado] posición {sym} ilegible: {exc}")
         ex = doc.get("executor") or {}
@@ -937,7 +951,7 @@ class KlineBot:
             self.log("[estado] Perdí el control mientras aplicaba el estado; sigo esperando")
             return
         if late and self.price_cache is not None:
-            self.price_cache.ensure_symbols(list(positions))
+            self.price_cache.ensure_symbols(sorted({p.symbol for p in positions.values()}))
         detail = ", ".join(f"{p.direction} {p.symbol} #{p.trade_id}" for p in positions.values()) or "ninguna"
         self.log(f"[estado] Recuperado desde {source}: abiertas: {detail} | "
                  f"historial: {len(rows)} cierres | executor → {self.executor.target.url or '(vacío)'}")
@@ -1146,6 +1160,8 @@ def api_block():
 
 @app.post("/api/close/<symbol>")
 def api_close(symbol: str):
+    """Cierre manual: /api/close/<trade_id> cierra esa posición;
+    /api/close/<SÍMBOLO> cierra todas las del par."""
     busy = _guard()
     if busy:
         return busy
@@ -1379,7 +1395,7 @@ async function refresh() {
     <td>${pct(r.move_pct)}</td><td>${num(r.tp_price, 8)}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
     <td>${pct(r.mfe_pct)} <span class="muted">${usd(r.mfe_usd)}</span></td><td>${pct(r.mae_pct)} <span class="muted">${usd(r.mae_usd)}</span></td>
     <td>${esc(r.opened)} <span class="muted">(${dur(r.age_s)})</span></td>
-    <td><button class="small" data-close="${esc(r.symbol)}">Cerrar</button></td></tr>`).join('')
+    <td><button class="small" data-close="${r.trade_id}" data-label="${esc(r.direction)} ${esc(r.symbol)} #${r.trade_id}">Cerrar</button></td></tr>`).join('')
     || '<tr><td colspan="13" class="muted">Sin posiciones abiertas</td></tr>';
 
   q('tSig').innerHTML = d.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
@@ -1458,7 +1474,7 @@ document.addEventListener('click', async ev => {
     return;
   }
   const sym = ev.target.dataset && ev.target.dataset.close;
-  if (!sym || !confirm(`¿Cerrar ${sym} a mercado?`)) return;
+  if (!sym || !confirm(`¿Cerrar ${ev.target.dataset.label || sym} a mercado?`)) return;
   try {
     const r = await (await fetch('/api/close/' + encodeURIComponent(sym), {method: 'POST', headers: headers(), body: '{}'})).json();
     alert(r.ok ? r.msg : (r.error || r.msg));

@@ -9,7 +9,7 @@ Aplicación web para Render que vigila las velas de 1 minuto de **todos** los pe
    - Sube **≥ 3 %** → abre **LONG**.
    - Baja **≥ 3 %** → abre **SHORT**.
 3. **Tamaño**: notional fijo de **5 USDT**. La cantidad se redondea hacia arriba al `stepSize` del par para no quedar por debajo del mínimo de Binance. Los pares que exigen más de 5 USDT, o cuyo `stepSize` obliga a más de 1,5× el notional, se saltan y quedan anotados en la tabla de señales.
-4. **Una posición por símbolo**: mientras esté abierta, las señales nuevas de ese símbolo se ignoran.
+4. **Varias posiciones por símbolo**: cada señal abre su propia posición aunque ya haya otras abiertas en ese par, en la misma dirección o en la contraria (cada una con su `trade_id`, su TP y su cierre). Solo se evita repetir la señal de una misma vela.
 5. **Salida**: se cierra cuando el precio avanza **2 % o más** a favor desde la entrada (precio en tiempo real de `WS.py`: bookTicker del símbolo + `!markPrice@arr`). **No hay stop loss**; solo cierre manual desde la web.
 
 Las cifras se configuran con variables de entorno (tabla abajo). El **% de la señal** y el **% del TP** también se cambian en caliente desde el bloque *Parámetros* de la web o con `POST /api/config` (`{"threshold_pct": 3, "tp_pct": 2}`). El umbral aplica desde la siguiente vela; el TP nuevo también se aplica a las posiciones abiertas. Los valores se guardan en `SETTINGS_FILE`.
@@ -86,7 +86,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `GET /api/status` | Estado completo en JSON. |
 | `GET/POST /api/executor` | Ver o cambiar el link del Executor. |
 | `GET/POST /api/config` | Ver o cambiar el % de la señal y del TP. |
-| `POST /api/close/<SÍMBOLO>` | Cierre manual. |
+| `POST /api/close/<trade_id>` | Cierre manual de una posición (`/api/close/<SÍMBOLO>` cierra todas las del par). |
 | `GET /api/trades` | Historial de cierres. |
 | `GET /api/trades.csv` | Historial con MFE/MAE en CSV. |
 | `POST /api/block` | Bloquear o permitir LONG o SHORT. |
