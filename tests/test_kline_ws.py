@@ -28,6 +28,13 @@ def test_parse_closed_candle():
     assert (o, c) == (1.5, 1.2)
 
 
+def test_parse_live_returns_open_and_closed_candles():
+    p = parse_kline_message(_msg(o="1", c="1.04", closed=False), closed_only=False)
+    assert p[0] == "BTCUSDT" and p[6] == 1.04 and p[8] is False
+    assert parse_kline_message(_msg(closed=True), closed_only=False)[8] is True
+    assert parse_kline_message('{"result":null,"id":1}', closed_only=False) is None
+
+
 def test_ring_keeps_last_n_in_order_with_wraparound():
     r = KlineRing("1m", history=3)
     for i in range(1, 8):

@@ -20,10 +20,16 @@ services:
         value: "3.12.13"
 
       # ── Estrategia ──────────────────────────────────────────────────────────
+      # Bot al cierre (vela 1m cerrada)
       - key: SIGNAL_THRESHOLD_PCT
         value: "3"            # cuerpo mínimo de la última vela 1m (sube → LONG, baja → SHORT)
       - key: TAKE_PROFIT_PCT
         value: "2"            # cierra al avanzar este % a favor. Sin stop loss.
+      # Bot en vivo (vela 1m en curso, entra sin esperar al cierre)
+      - key: LIVE_SIGNAL_THRESHOLD_PCT
+        value: "3"
+      - key: LIVE_TAKE_PROFIT_PCT
+        value: "2"
       - key: NOTIONAL_USDT
         value: "5"            # USDT por entrada
       - key: COOLDOWN_SECONDS

@@ -1,20 +1,28 @@
 """
-app.py — Bot de velas 1m (Binance USDⓈ-M Futures) que sigue la tendencia.
+app.py — Dos bots de velas 1m (Binance USDⓈ-M Futures) que siguen la tendencia,
+en paralelo y con operaciones e historial separados, sobre la misma web.
 
-Estrategia
+Estrategia (común)
   • Velas 1m de TODOS los perpetuos USDT por WebSocket (kline_ws.py, sin REST).
-    Se guardan las dos últimas velas cerradas de cada símbolo.
-  • Al cerrar cada vela se mide su cuerpo: (cierre - apertura) / apertura.
-      ≥ +SIGNAL_THRESHOLD_PCT (3 %)  → abre LONG
-      ≤ -SIGNAL_THRESHOLD_PCT (-3 %) → abre SHORT
+  • Cuerpo de la vela = (cierre o último precio - apertura) / apertura.
+      ≥ +umbral (3 %) → abre LONG   |   ≤ -umbral (-3 %) → abre SHORT
   • Cada entrada usa un notional fijo de NOTIONAL_USDT (5 USDT). Cada señal
     abre su propia posición aunque ya haya otras en el par, en cualquier
     dirección (se identifican por trade_id).
-  • Cierre cuando el precio avanza TAKE_PROFIT_PCT (2 %) o más a favor desde
-    la entrada. SIN stop loss (solo cierre manual desde la web).
-  • Las órdenes NO salen de aquí: se mandan como señales al Executor externo
-    (POST <executor>/signal), igual que antes. El link del Executor se puede
-    cambiar en caliente desde la web o con POST /api/executor.
+  • Cierre cuando el precio avanza el TP (2 %) o más a favor desde la entrada.
+    SIN stop loss (solo cierre manual desde la web).
+
+Los dos bots
+  • Bot al cierre ("close"): mira la vela cuando CIERRA.
+  • Bot en vivo ("live"): mira la vela EN CURSO (Binance la manda cada ~250 ms)
+    y entra en cuanto el cuerpo supera su umbral, sin esperar al cierre. Una
+    sola entrada por símbolo y vela.
+  Cada uno tiene su umbral, su TP, sus bloqueos LONG/SHORT, sus posiciones y
+  su historial. Comparten los WebSockets, el executor y la web.
+
+  Las órdenes NO salen de aquí: se mandan como señales al Executor externo
+  (POST <executor>/signal) con "strategy": "close" | "live". El link del
+  Executor se puede cambiar en caliente desde la web o con POST /api/executor.
 
 Precios para el take profit: WS.py (!markPrice@arr de todos los símbolos +
 bookTicker en tiempo real de los que tienen posición abierta).
@@ -82,6 +90,9 @@ SIGNAL_MAX_DELAY_S   = float(os.getenv("SIGNAL_MAX_DELAY_S", "10"))
 COOLDOWN_SECONDS     = float(os.getenv("COOLDOWN_SECONDS", "0"))
 PRICE_MAX_AGE_S      = float(os.getenv("PRICE_MAX_AGE_S", "5"))         # precio más viejo no se usa
 SAFETY_TICK_SECS     = float(os.getenv("SAFETY_TICK_SECS", "1"))        # revisión periódica del TP
+# Bot en vivo (vela en curso): por defecto los mismos % que el bot al cierre.
+LIVE_SIGNAL_THRESHOLD_PCT = float(os.getenv("LIVE_SIGNAL_THRESHOLD_PCT", str(SIGNAL_THRESHOLD_PCT)))
+LIVE_TAKE_PROFIT_PCT      = float(os.getenv("LIVE_TAKE_PROFIT_PCT", str(TAKE_PROFIT_PCT)))
 
 # ── Velas ─────────────────────────────────────────────────────────────────────
 KLINE_INTERVAL = "1m"
@@ -247,7 +258,7 @@ class ExecutorBridge:
         self.last_ok_ts = time.time()
         self.last_http_ms = http_ms
         self.last_total_ms = total_ms
-        since = f" | desde el cierre de la vela {total_ms:.0f} ms" if t0 else ""
+        since = f" | desde el mensaje de Binance {total_ms:.0f} ms" if t0 else ""
         self._log(f"[executor] ✓ {what} → {target.url} | HTTP {http_ms:.0f} ms{since}")
         return True
 
@@ -305,6 +316,8 @@ class Position:
     mae_ts:      float = 0.0
     high_price:  float = 0.0    # precio máximo y mínimo vistos
     low_price:   float = 0.0
+    strategy:    str = "close"  # bot que la abrió: close | live
+    candle_age_s: float = 0.0   # segundos de vela transcurridos al entrar (bot en vivo)
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -324,6 +337,43 @@ class Position:
         return move
 
 
+ENGINE_CLOSE = "close"
+ENGINE_LIVE  = "live"
+ENGINE_LABELS = {ENGINE_CLOSE: "Bot al cierre", ENGINE_LIVE: "Bot en vivo"}
+ENGINE_HINTS = {
+    ENGINE_CLOSE: "entra cuando la vela 1m CIERRA con cuerpo ≥ umbral",
+    ENGINE_LIVE:  "entra en cuanto la vela 1m EN CURSO supera el umbral, sin esperar al cierre",
+}
+
+
+class Engine:
+    """Estado de UN bot. Los dos bots comparten los WebSockets, el executor y
+    la web, pero cada uno tiene sus parámetros, bloqueos, posiciones, señales
+    e historial. Todo se toca con el lock de KlineBot."""
+
+    def __init__(self, name: str, cfg: dict, threshold_default: float, tp_default: float) -> None:
+        self.name  = name
+        self.label = ENGINE_LABELS[name]
+        self.threshold_pct = float(cfg.get("threshold_pct") or threshold_default)
+        self.tp_pct = float(cfg.get("tp_pct") or tp_default)
+        self.blocked = {strategy.LONG: bool(cfg.get("block_long")),
+                        strategy.SHORT: bool(cfg.get("block_short"))}
+        # trade_id → posición. Puede haber varias por símbolo y en ambas direcciones.
+        self.positions: Dict[int, Position] = {}
+        self.closed_trades: List[dict] = []
+        self.signals: Deque[dict] = deque(maxlen=200)
+        self.cooldown: Dict[str, float] = {}
+        self.total_realized_pnl = 0.0
+        self.signal_count = 0
+        self.opened_count = 0
+        self._last_candle: Dict[str, int] = {}      # dedupe de señales por símbolo (loop del bot)
+        self._decide_ms: Deque[float] = deque(maxlen=200)
+
+    def settings(self) -> dict:
+        return {"threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct,
+                "block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT]}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BOT
 # ─────────────────────────────────────────────────────────────────────────────
@@ -331,16 +381,8 @@ class Position:
 class KlineBot:
     def __init__(self) -> None:
         self.lock = threading.RLock()
-        # trade_id → posición. Puede haber varias por símbolo y en ambas direcciones.
-        self.positions: Dict[int, Position] = {}
-        self.closed_trades: List[dict] = []
-        self.signals: Deque[dict] = deque(maxlen=200)
         self.events: Deque[str] = deque(maxlen=200)
-        self.cooldown: Dict[str, float] = {}
-        self.total_realized_pnl = 0.0
         self.trade_id_seq = 0
-        self.signal_count = 0
-        self.opened_count = 0
         self.last_error = ""
 
         self.filters: Dict[str, Dict[str, float]] = {}
@@ -355,32 +397,39 @@ class KlineBot:
         self.started_at = time.time()
 
         self._pos_syms: frozenset = frozenset()     # copia para el hilo del WS (sin lock)
-        self._last_candle: Dict[str, int] = {}      # dedupe de cierres por símbolo
         self._pending: set = set()                  # símbolos con tick de precio pendiente
         self._pending_lock = threading.Lock()
         self._wake_scheduled = False
         self._tick_event: Optional[asyncio.Event] = None
         self._closing: set = set()
         self._inflight = 0
+        # Bot en vivo: vela (open_time) en la que ya disparó cada símbolo. Solo
+        # lo toca el hilo del WS de velas, así cada vela genera UNA señal.
+        self._live_fired: Dict[str, int] = {}
+        self.live_updates = 0
 
         settings = self._load_settings()
         self.executor = ExecutorBridge(settings.get("executor_url", EXECUTOR_URL),
                                        settings.get("executor_secret", EXECUTOR_SECRET),
                                        logger=self.log)
         self.executor_changed_ts = float(settings.get("executor_changed_ts") or 0.0)
-        # Parámetros editables en caliente desde la web (POST /api/config).
-        self.threshold_pct = float(settings.get("threshold_pct") or SIGNAL_THRESHOLD_PCT)
-        self.tp_pct = float(settings.get("tp_pct") or TAKE_PROFIT_PCT)
-        # Bloqueo manual por dirección (botones de la web): no abre nuevas entradas.
-        self.blocked = {strategy.LONG: bool(settings.get("block_long")),
-                        strategy.SHORT: bool(settings.get("block_short"))}
+        # Parámetros de cada bot, editables en caliente desde la web. Los
+        # ajustes de la versión de un solo bot (claves sueltas) pasan al de cierre.
+        saved = settings.get("engines") if isinstance(settings.get("engines"), dict) else {}
+        legacy = {k: settings.get(k) for k in ("threshold_pct", "tp_pct", "block_long", "block_short")}
+        self.engines: Dict[str, Engine] = {
+            ENGINE_CLOSE: Engine(ENGINE_CLOSE, saved.get(ENGINE_CLOSE) or legacy,
+                                 SIGNAL_THRESHOLD_PCT, TAKE_PROFIT_PCT),
+            ENGINE_LIVE:  Engine(ENGINE_LIVE, saved.get(ENGINE_LIVE) or {},
+                                 LIVE_SIGNAL_THRESHOLD_PCT, LIVE_TAKE_PROFIT_PCT),
+        }
+        self.live = self.engines[ENGINE_LIVE]
 
         # Evaluaciones: cada cierre de vela 1m se mide, pase o no el umbral.
         # minuto (open_time ms) → [(cuerpo %, símbolo, apertura, cierre), ...]
         self._evals: Dict[int, List[Tuple[float, str, float, float]]] = {}
         self._evals_lock = threading.Lock()
         self.eval_count = 0
-        self._decide_ms: Deque[float] = deque(maxlen=200)    # cierre recibido → señal encolada
 
         # Upstash desactivado por ahora: solo copia local (backend=None).
         self._store_desc = f"solo disco local ({RECOVERY_FILE})"
@@ -398,18 +447,30 @@ class KlineBot:
         with self.lock:
             self.events.appendleft(line)
 
+    def engine(self, name: Optional[str]) -> Optional[Engine]:
+        return self.engines.get(str(name or ENGINE_CLOSE).lower())
+
     def _next_trade_id(self) -> int:
         with self.lock:
             # Arranca en la hora Unix para no repetir ids que el Executor ya vio
-            # de versiones anteriores del bot.
+            # de versiones anteriores del bot. Secuencia común a los dos bots.
             self.trade_id_seq = max(self.trade_id_seq + 1, int(time.time()))
             return self.trade_id_seq
 
     def _refresh_pos_syms(self) -> None:
         with self.lock:
-            self._pos_syms = frozenset(p.symbol for p in self.positions.values())
+            self._pos_syms = frozenset(p.symbol for e in self.engines.values()
+                                       for p in e.positions.values())
 
-    # ── Ajustes locales (link del executor) ───────────────────────────────────
+    def _find(self, trade_id: int) -> Tuple[Optional[Engine], Optional[Position]]:
+        with self.lock:
+            for eng in self.engines.values():
+                pos = eng.positions.get(trade_id)
+                if pos is not None:
+                    return eng, pos
+        return None, None
+
+    # ── Ajustes locales (link del executor y parámetros) ──────────────────────
 
     @staticmethod
     def _load_settings() -> dict:
@@ -424,8 +485,7 @@ class KlineBot:
         t = self.executor.target
         data = {"executor_url": t.url, "executor_secret": t.secret,
                 "executor_changed_ts": self.executor_changed_ts,
-                "threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct,
-                "block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT]}
+                "engines": {n: e.settings() for n, e in self.engines.items()}}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -434,36 +494,38 @@ class KlineBot:
         except Exception as exc:
             self.log(f"No pude guardar ajustes locales: {exc}")
 
-    def set_config(self, threshold_pct: Optional[float] = None,
+    def set_config(self, eng: Engine, threshold_pct: Optional[float] = None,
                    tp_pct: Optional[float] = None) -> dict:
-        """Cambia en caliente el % de la señal y/o el % del TP. El umbral aplica
-        a la siguiente vela; el TP también a las posiciones ya abiertas."""
+        """Cambia en caliente el % de la señal y/o el % del TP de un bot. El
+        umbral aplica a la siguiente señal; el TP también a sus posiciones abiertas."""
         changes = []
-        if threshold_pct is not None and threshold_pct != self.threshold_pct:
-            changes.append(f"señal {self.threshold_pct:g}% → {threshold_pct:g}%")
-            self.threshold_pct = threshold_pct
-        if tp_pct is not None and tp_pct != self.tp_pct:
-            changes.append(f"TP {self.tp_pct:g}% → {tp_pct:g}%")
-            self.tp_pct = tp_pct
+        if threshold_pct is not None and threshold_pct != eng.threshold_pct:
+            changes.append(f"señal {eng.threshold_pct:g}% → {threshold_pct:g}%")
+            eng.threshold_pct = threshold_pct
+        if tp_pct is not None and tp_pct != eng.tp_pct:
+            changes.append(f"TP {eng.tp_pct:g}% → {tp_pct:g}%")
+            eng.tp_pct = tp_pct
             with self.lock:
-                for p in self.positions.values():
+                for p in eng.positions.values():
                     p.tp_price = strategy.take_profit_price(p.entry_price, p.direction, tp_pct)
-            for sym in list(self._pos_syms):
+                syms = {p.symbol for p in eng.positions.values()}
+            for sym in syms:
                 self._on_price_event(sym, "config")      # revisa ya el TP nuevo
         if changes:
             self._save_settings()
             self.store.mark_dirty(True)
-            self.log("[config] " + " | ".join(changes))
-        return {"threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct}
+            self.log(f"[config] {eng.label}: " + " | ".join(changes))
+        return {"engine": eng.name, "threshold_pct": eng.threshold_pct, "tp_pct": eng.tp_pct}
 
-    def set_block(self, direction: str, blocked: bool) -> dict:
-        """Bloquea o desbloquea las entradas nuevas de una dirección. Las
-        posiciones ya abiertas siguen su curso (TP o cierre manual)."""
-        if self.blocked[direction] != blocked:
-            self.blocked[direction] = blocked
+    def set_block(self, eng: Engine, direction: str, blocked: bool) -> dict:
+        """Bloquea o desbloquea las entradas nuevas de una dirección en un bot.
+        Las posiciones ya abiertas siguen su curso (TP o cierre manual)."""
+        if eng.blocked[direction] != blocked:
+            eng.blocked[direction] = blocked
             self._save_settings()
-            self.log(f"[config] {direction}: {'BLOQUEADOS' if blocked else 'permitidos'}")
-        return {"block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT]}
+            self.log(f"[config] {eng.label} · {direction}: {'BLOQUEADOS' if blocked else 'permitidos'}")
+        return {"engine": eng.name, "block_long": eng.blocked[strategy.LONG],
+                "block_short": eng.blocked[strategy.SHORT]}
 
     def set_executor(self, url: str, secret: Optional[str] = None) -> ExecutorTarget:
         """Cambia el destino de las señales en caliente (sin reiniciar)."""
@@ -497,9 +559,10 @@ class KlineBot:
             self.log(f"Bot detenido por error no controlado: {exc!r}")
 
     async def _main(self) -> None:
-        self.log(f"Bot iniciado | señal: cuerpo vela 1m ≥ {self.threshold_pct:g}% | "
-                 f"TP {self.tp_pct:g}% | {NOTIONAL_USDT:g} USDT | sin stop loss | "
-                 f"executor → {self.executor.target.url or '(vacío)'}")
+        for eng in self.engines.values():
+            self.log(f"{eng.label} | {ENGINE_HINTS[eng.name]} | señal ≥ {eng.threshold_pct:g}% | "
+                     f"TP {eng.tp_pct:g}% | {NOTIONAL_USDT:g} USDT | sin stop loss")
+        self.log(f"Executor → {self.executor.target.url or '(vacío)'}")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
         self.executor.warm()
@@ -517,11 +580,11 @@ class KlineBot:
 
         self.kline_stream = KlineWebSocketStream(
             self.symbols, intervals=(KLINE_INTERVAL,), history=KLINE_HISTORY,
-            dtype=KLINE_DTYPE, on_close=self._on_kline_close,
+            dtype=KLINE_DTYPE, on_close=self._on_kline_close, on_update=self._on_kline_live,
         )
         self.kline_stream.start()
         self.log(f"Velas 1m por WebSocket: {len(self.symbols)} símbolos, "
-                 f"{KLINE_HISTORY} velas cerradas por símbolo")
+                 f"{KLINE_HISTORY} velas cerradas por símbolo + vela en curso para el bot en vivo")
 
         await asyncio.gather(
             self._supervised(self._engine_loop, "engine"),
@@ -618,18 +681,43 @@ class KlineBot:
         self.symbols = sorted(self.filters)
         self.log(f"{len(self.symbols)} perpetuos {QUOTE_ASSET} operables")
 
-    # ── Entradas: cierre de vela (hilo del WS de velas) ───────────────────────
+    # ── Entradas (hilo del WS de velas: solo filtrar y pasar al loop) ─────────
 
-    def _on_kline_close(self, symbol: str, interval: str, candle: Candle) -> None:
-        """Debe ser instantáneo: solo filtra y pasa la señal al loop del bot."""
-        self._record_eval(symbol, candle)
-        direction = strategy.signal_direction(candle.open, candle.close, self.threshold_pct)
-        if direction is None:
+    def _on_kline_live(self, symbol: str, interval: str, candle: Candle) -> None:
+        """Vela EN CURSO (cada ~250 ms por símbolo) → bot en vivo. Dispara en
+        cuanto el cuerpo supera el umbral, una sola vez por vela."""
+        self.live_updates += 1
+        o = candle.open
+        if o <= 0:
             return
+        thr = self.live.threshold_pct
+        body = (candle.close - o) / o * 100.0
+        if -thr < body < thr or self._live_fired.get(symbol) == candle.open_time:
+            return
+        self._live_fired[symbol] = candle.open_time
         loop = self.loop
         if loop is not None:
-            loop.call_soon_threadsafe(self._handle_signal, symbol, direction, candle, time.time(),
-                                      time.perf_counter())
+            direction = strategy.LONG if body >= thr else strategy.SHORT
+            loop.call_soon_threadsafe(self._handle_signal, self.live, symbol, direction, candle,
+                                      time.time(), time.perf_counter())
+
+    def _on_kline_close(self, symbol: str, interval: str, candle: Candle) -> None:
+        """Cierre de vela → bot al cierre. El bot en vivo también lo mira por si
+        el umbral se cruzó justo en el último tick (si ya disparó, no repite)."""
+        self._record_eval(symbol, candle)
+        loop = self.loop
+        if loop is None:
+            return
+        arrived, t0 = time.time(), time.perf_counter()
+        for eng in self.engines.values():
+            direction = strategy.signal_direction(candle.open, candle.close, eng.threshold_pct)
+            if direction is None:
+                continue
+            if eng is self.live:
+                if self._live_fired.get(symbol) == candle.open_time:
+                    continue
+                self._live_fired[symbol] = candle.open_time
+            loop.call_soon_threadsafe(self._handle_signal, eng, symbol, direction, candle, arrived, t0)
 
     def _record_eval(self, symbol: str, candle: Candle) -> None:
         body = strategy.body_change_pct(candle.open, candle.close)
@@ -642,9 +730,9 @@ class KlineBot:
                     del self._evals[old]
             rows.append((body, symbol, candle.open, candle.close))
 
-    def evaluations(self) -> dict:
-        """Resumen por minuto y los mayores cuerpos del último minuto cerrado."""
-        thr = self.threshold_pct
+    def evaluations(self, thr: float) -> dict:
+        """Resumen por minuto y los mayores cuerpos del último minuto cerrado,
+        contados con el umbral `thr` (el de cada bot)."""
         with self._evals_lock:
             buckets = [(t, list(rows)) for t, rows in sorted(self._evals.items(), reverse=True)]
         minutes = []
@@ -667,80 +755,82 @@ class KlineBot:
         return {"total": self.eval_count, "minutes": minutes, "top": top,
                 "top_minute": minutes[0]["minute"] if minutes else ""}
 
-    def _record_signal(self, symbol: str, direction: str, candle: Candle, action: str) -> None:
+    def _record_signal(self, eng: Engine, symbol: str, direction: str, candle: Candle,
+                       action: str, candle_age_s: float) -> None:
+        now = time.time()
         with self.lock:
-            self._append_signal(symbol, direction, candle, action)
+            eng.signals.appendleft({
+                "ts":        now,
+                "time":      _utc(now, "%H:%M:%S"),
+                "symbol":    symbol,
+                "direction": direction,
+                "body_pct":  strategy.body_change_pct(candle.open, candle.close),
+                "open":      candle.open,
+                "close":     candle.close,
+                "candle":    _utc(candle.open_time / 1000, "%H:%M"),
+                "candle_age_s": candle_age_s,
+                "action":    action,
+            })
 
-    def _append_signal(self, symbol: str, direction: str, candle: Candle, action: str) -> None:
-        self.signals.appendleft({
-            "ts":        time.time(),
-            "time":      _utc(time.time(), "%H:%M:%S"),
-            "symbol":    symbol,
-            "direction": direction,
-            "body_pct":  strategy.body_change_pct(candle.open, candle.close),
-            "open":      candle.open,
-            "close":     candle.close,
-            "candle":    _utc(candle.open_time / 1000, "%H:%M"),
-            "action":    action,
-        })
-
-    def _handle_signal(self, symbol: str, direction: str, candle: Candle, arrived: float,
-                       t0: float = 0.0) -> None:
-        """Corre en el loop del bot. Decide si abrir y lanza la apertura."""
-        if self._last_candle.get(symbol, -1) >= candle.open_time:
+    def _handle_signal(self, eng: Engine, symbol: str, direction: str, candle: Candle,
+                       arrived: float, t0: float = 0.0) -> None:
+        """Corre en el loop del bot. Decide si `eng` abre y lanza la apertura."""
+        if eng._last_candle.get(symbol, -1) >= candle.open_time:
             return                                          # duplicado tras reconexión
-        self._last_candle[symbol] = candle.open_time
-        self.signal_count += 1
+        eng._last_candle[symbol] = candle.open_time
+        eng.signal_count += 1
         body = strategy.body_change_pct(candle.open, candle.close)
+        # Segundos de vela transcurridos (60 = al cierre).
+        age = min(max(arrived - candle.open_time / 1000, 0.0), (candle.close_time + 1 - candle.open_time) / 1000)
 
-        delay = arrived - candle.close_time / 1000
+        def skip(action: str) -> None:
+            self._record_signal(eng, symbol, direction, candle, action, age)
+
+        delay = arrived - candle.close_time / 1000          # negativo con la vela abierta
         if delay > SIGNAL_MAX_DELAY_S:
-            self._record_signal(symbol, direction, candle, f"ignorada: llegó {delay:.0f}s tarde")
-            return
-        if self.blocked.get(direction):
-            self._record_signal(symbol, direction, candle, f"bloqueada: {direction} desactivados")
-            return
+            return skip(f"ignorada: llegó {delay:.0f}s tarde")
+        if eng.blocked.get(direction):
+            return skip(f"bloqueada: {direction} desactivados")
         if not self.store.can_open():
-            self._record_signal(symbol, direction, candle, "ignorada: estado sin confirmar")
-            return
+            return skip("ignorada: estado sin confirmar")
         # Sin límite por símbolo: cada señal abre su propia posición aunque ya
         # haya otras abiertas en ese par, en la misma o en la otra dirección.
         with self.lock:
-            until = self.cooldown.get(symbol, 0.0)
+            until = eng.cooldown.get(symbol, 0.0)
         if until > time.time():
-            self._record_signal(symbol, direction, candle, "ignorada: en pausa tras cierre")
-            return
+            return skip("ignorada: en pausa tras cierre")
 
-        # El cierre de la vela es el último trade: más fresco que el mark price
-        # (1-3 s) que hay para los símbolos sin bookTicker suscrito.
+        # El último precio de la vela es el último trade: más fresco que el mark
+        # price (1-3 s) que hay para los símbolos sin bookTicker suscrito.
         price = candle.close
         f = self.filters.get(symbol, {})
         qty, eff, why = strategy.size_order(
             NOTIONAL_USDT, price, f.get("stepSize", 0.001), f.get("minQty", 0.0),
             f.get("minNotional", 5.0), MAX_NOTIONAL_OVER)
         if qty <= 0:
-            self._record_signal(symbol, direction, candle, f"saltada: {why}")
-            self.log(f"Señal {direction} {symbol} ({body:+.2f}%) saltada: {why}")
-            return
+            self.log(f"[{eng.label}] señal {direction} {symbol} ({body:+.2f}%) saltada: {why}")
+            return skip(f"saltada: {why}")
 
         pos = Position(
             trade_id=self._next_trade_id(), symbol=symbol, direction=direction,
             entry_price=price, qty=qty, notional=eff,
-            tp_price=strategy.take_profit_price(price, direction, self.tp_pct),
+            tp_price=strategy.take_profit_price(price, direction, eng.tp_pct),
             signal_pct=body, candle_open=candle.open, candle_close=candle.close,
             candle_time=candle.open_time, last_price=price,
+            strategy=eng.name, candle_age_s=round(age, 2),
         )
         with self.lock:
-            self.positions[pos.trade_id] = pos
-            self.opened_count += 1
+            eng.positions[pos.trade_id] = pos
+            eng.opened_count += 1
         self._refresh_pos_syms()
         if self.price_cache is not None:
             self.price_cache.ensure_symbols([symbol])       # bookTicker en tiempo real
         self.store.mark_dirty(True)
         decide_ms = (time.perf_counter() - t0) * 1000 if t0 else 0.0
-        self._record_signal(symbol, direction, candle, f"abierta #{pos.trade_id} en {decide_ms:.1f} ms")
-        self.log(f"ABRE {direction} {symbol} | vela {candle.open:g}→{candle.close:g} ({body:+.2f}%) | "
-                 f"px={price:g} qty={qty:g} ({eff:.2f} USDT) | TP {pos.tp_price:g} | trade #{pos.trade_id}")
+        skip(f"abierta #{pos.trade_id} en {decide_ms:.1f} ms")
+        self.log(f"[{eng.label}] ABRE {direction} {symbol} | vela {candle.open:g}→{candle.close:g} "
+                 f"({body:+.2f}% a los {age:.0f}s) | px={price:g} qty={qty:g} ({eff:.2f} USDT) | "
+                 f"TP {pos.tp_price:g} | trade #{pos.trade_id}")
         self.executor.send({
             "action":    "open",
             "trade_id":  pos.trade_id,
@@ -750,8 +840,9 @@ class KlineBot:
             "quantity":  qty,
             "notional":  round(eff, 4),
             "level":     round(body, 4),
+            "strategy":  eng.name,
         }, t0)
-        self._decide_ms.append(decide_ms)
+        eng._decide_ms.append(decide_ms)
 
     # ── Salidas: ticks de precio (hilo del WS de precios) ─────────────────────
 
@@ -789,32 +880,33 @@ class KlineBot:
         return pc.get_price(symbol, max_age_s=PRICE_MAX_AGE_S)
 
     def _check_take_profit(self, symbol: str) -> None:
-        """Revisa el TP de TODAS las posiciones abiertas del símbolo."""
+        """Revisa el TP de TODAS las posiciones abiertas del símbolo, de los dos bots."""
         price = self._price(symbol)
         if not price:
             return
         hits = []
         with self.lock:
-            for tid, pos in self.positions.items():
-                if pos.symbol != symbol:
-                    continue
-                pos.update(price)
-                if (price >= pos.tp_price) if pos.direction == strategy.LONG else (price <= pos.tp_price):
-                    hits.append(tid)
+            for eng in self.engines.values():
+                for tid, pos in eng.positions.items():
+                    if pos.symbol != symbol:
+                        continue
+                    pos.update(price)
+                    if (price >= pos.tp_price) if pos.direction == strategy.LONG else (price <= pos.tp_price):
+                        hits.append(tid)
         if hits and self.store.can_act():
             for tid in hits:
                 self._close(tid, price, "TP")
 
     def _close(self, trade_id: int, price: float, reason: str) -> bool:
         with self.lock:
-            pos = self.positions.get(trade_id)
+            eng, pos = self._find(trade_id)
             if pos is None or trade_id in self._closing:
                 return False
             self._closing.add(trade_id)
         symbol = pos.symbol
         try:
             with self.lock:
-                pos = self.positions.pop(trade_id, None)
+                pos = eng.positions.pop(trade_id, None)
                 if pos is None:
                     return False
                 pos.update(price)
@@ -832,16 +924,16 @@ class KlineBot:
                     "time_to_mfe_s": (pos.mfe_ts - pos.opened_ts) if pos.mfe_ts else 0.0,
                     "time_to_mae_s": (pos.mae_ts - pos.opened_ts) if pos.mae_ts else 0.0,
                 }
-                self.total_realized_pnl += pnl
-                self.closed_trades.insert(0, rec)
-                del self.closed_trades[500:]
+                eng.total_realized_pnl += pnl
+                eng.closed_trades.insert(0, rec)
+                del eng.closed_trades[500:]
                 if COOLDOWN_SECONDS > 0:
-                    self.cooldown[symbol] = now + COOLDOWN_SECONDS
+                    eng.cooldown[symbol] = now + COOLDOWN_SECONDS
                 # Misma sección crítica que saca la posición: el guardado lleva ambas cosas.
                 self.store.append_trade(rec)
             self._refresh_pos_syms()
             self.store.mark_dirty(True)
-            self.log(f"CIERRA {pos.direction} {symbol} ({reason}) | entrada {pos.entry_price:g} → "
+            self.log(f"[{eng.label}] CIERRA {pos.direction} {symbol} ({reason}) | entrada {pos.entry_price:g} → "
                      f"{price:g} ({rec['move_pct']:+.2f}%) | PnL {pnl:+.4f} USDT | trade #{pos.trade_id}")
             self.executor.send({
                 "action":      "close",
@@ -851,20 +943,23 @@ class KlineBot:
                 "reason":      reason,
                 "close_price": price,
                 "pnl":         round(pnl, 6),
+                "strategy":    eng.name,
             })
             return True
         finally:
             with self.lock:
                 self._closing.discard(trade_id)
 
-    def close_manual(self, ref: str) -> Tuple[bool, str]:
+    def close_manual(self, ref: str, eng: Optional[Engine] = None) -> Tuple[bool, str]:
         """Cierre manual desde la web (corre en el loop del bot). `ref` es un
-        trade_id (cierra esa posición) o un símbolo (cierra todas las de ese par)."""
+        trade_id (cierra esa posición) o un símbolo (cierra todas las de ese
+        par, solo del bot `eng` si se indica)."""
+        engines = [eng] if eng is not None else list(self.engines.values())
         with self.lock:
             if ref.isdigit():
-                targets = [p for t, p in self.positions.items() if t == int(ref)]
+                targets = [p for e in engines for t, p in e.positions.items() if t == int(ref)]
             else:
-                targets = [p for p in self.positions.values() if p.symbol == ref.upper()]
+                targets = [p for e in engines for p in e.positions.values() if p.symbol == ref.upper()]
         if not targets:
             return False, "No hay posición abierta con ese trade o símbolo"
         closed = 0
@@ -886,9 +981,10 @@ class KlineBot:
             now = time.time()
             for sym in list(self._pos_syms):              # red de seguridad del TP
                 self._check_take_profit(sym)
-            if self.cooldown:
-                with self.lock:
-                    self.cooldown = {s: t for s, t in self.cooldown.items() if t > now}
+            with self.lock:
+                for eng in self.engines.values():
+                    if eng.cooldown:
+                        eng.cooldown = {s: t for s, t in eng.cooldown.items() if t > now}
             if now - last_persist >= STATE_PERSIST_SECS:
                 last_persist = now
                 self.store.mark_dirty(False)              # MFE/MAE con el latido
@@ -901,11 +997,13 @@ class KlineBot:
         now = time.time()
         with self.lock:
             doc = {
-                "v": 2,
+                "v": 3,
                 "trade_id_seq": self.trade_id_seq,
-                "total_realized_pnl": self.total_realized_pnl,
-                "positions": {str(t): asdict(p) for t, p in self.positions.items()},
-                "cooldowns": {s: t for s, t in self.cooldown.items() if t > now},
+                "positions": {str(t): asdict(p) for e in self.engines.values()
+                              for t, p in e.positions.items()},
+                "engines": {n: {"total_realized_pnl": e.total_realized_pnl,
+                                "cooldowns": {s: t for s, t in e.cooldown.items() if t > now}}
+                            for n, e in self.engines.items()},
             }
             trades = self.store.peek_trades()
         t = self.executor.target
@@ -921,13 +1019,16 @@ class KlineBot:
         doc, trades, source = r
         doc = doc or {}
         names = {f.name for f in fields(Position)}
-        positions: Dict[int, Position] = {}
-        for sym, d in (doc.get("positions") or {}).items():
+        # Lo guardado por la versión de un solo bot (sin "strategy") va al bot al cierre.
+        route = lambda d: d.get("strategy") if d.get("strategy") in self.engines else ENGINE_CLOSE  # noqa: E731
+        positions: Dict[str, Dict[int, Position]] = {n: {} for n in self.engines}
+        for key, d in (doc.get("positions") or {}).items():
             try:
                 pos = Position(**{k: v for k, v in d.items() if k in names})
-                positions[pos.trade_id] = pos
+                pos.strategy = route(d)
+                positions[pos.strategy][pos.trade_id] = pos
             except Exception as exc:
-                self.log(f"[estado] posición {sym} ilegible: {exc}")
+                self.log(f"[estado] posición {key} ilegible: {exc}")
         ex = doc.get("executor") or {}
         try:
             changed = float(ex.get("changed_ts") or 0.0)
@@ -939,20 +1040,26 @@ class KlineBot:
             self._save_settings()
         rows = [t for t in trades if isinstance(t, dict)]
         rows.sort(key=lambda t: float(t.get("closed_at_ts") or 0), reverse=True)
+        per_engine = doc.get("engines") or {
+            ENGINE_CLOSE: {"total_realized_pnl": doc.get("total_realized_pnl"),
+                           "cooldowns": doc.get("cooldowns")}}
         with self.lock:
-            self.positions = positions
-            self.cooldown = {s: float(t) for s, t in (doc.get("cooldowns") or {}).items()}
-            self.total_realized_pnl = float(doc.get("total_realized_pnl") or 0.0)
-            self.trade_id_seq = max(int(doc.get("trade_id_seq") or 0),
-                                    *[p.trade_id for p in positions.values()], 0)
-            self.closed_trades = rows[:500]
+            for name, eng in self.engines.items():
+                saved = per_engine.get(name) or {}
+                eng.positions = positions[name]
+                eng.cooldown = {s: float(t) for s, t in (saved.get("cooldowns") or {}).items()}
+                eng.total_realized_pnl = float(saved.get("total_realized_pnl") or 0.0)
+                eng.closed_trades = [t for t in rows if route(t) == name][:500]
+            all_pos = [p for ps in positions.values() for p in ps.values()]
+            self.trade_id_seq = max(int(doc.get("trade_id_seq") or 0), *[p.trade_id for p in all_pos], 0)
         self._refresh_pos_syms()
         if not self.store.enable_writes():
             self.log("[estado] Perdí el control mientras aplicaba el estado; sigo esperando")
             return
         if late and self.price_cache is not None:
-            self.price_cache.ensure_symbols(sorted({p.symbol for p in positions.values()}))
-        detail = ", ".join(f"{p.direction} {p.symbol} #{p.trade_id}" for p in positions.values()) or "ninguna"
+            self.price_cache.ensure_symbols(sorted({p.symbol for p in all_pos}))
+        detail = ", ".join(f"{ENGINE_LABELS[p.strategy]}: {p.direction} {p.symbol} #{p.trade_id}"
+                           for p in all_pos) or "ninguna"
         self.log(f"[estado] Recuperado desde {source}: abiertas: {detail} | "
                  f"historial: {len(rows)} cierres | executor → {self.executor.target.url or '(vacío)'}")
 
@@ -961,10 +1068,10 @@ class KlineBot:
 
     # ── Vista para la web ─────────────────────────────────────────────────────
 
-    def excursion_stats(self) -> dict:
-        """MFE/MAE agregados de las operaciones cerradas, total y por dirección."""
+    def excursion_stats(self, eng: Engine) -> dict:
+        """MFE/MAE agregados de las operaciones cerradas de un bot, total y por dirección."""
         with self.lock:
-            rows = list(self.closed_trades)
+            rows = list(eng.closed_trades)
 
         def agg(rs: List[dict]) -> dict:
             n = len(rs)
@@ -987,11 +1094,10 @@ class KlineBot:
             "SHORT": agg([r for r in rows if r.get("direction") == strategy.SHORT]),
         }
 
-    def snapshot(self) -> dict:
-        now = time.time()
+    def _engine_snapshot(self, eng: Engine, now: float) -> dict:
         with self.lock:
             positions = []
-            for p in sorted(self.positions.values(), key=lambda p: p.opened_ts, reverse=True):
+            for p in sorted(eng.positions.values(), key=lambda p: p.opened_ts, reverse=True):
                 price = self._price(p.symbol) or p.last_price
                 positions.append({
                     **asdict(p),
@@ -1002,22 +1108,47 @@ class KlineBot:
                     "opened":   _utc(p.opened_ts, "%m-%d %H:%M:%S"),
                 })
             closed = [{**t, "closed": _utc(t.get("closed_at_ts", 0), "%m-%d %H:%M:%S")}
-                      for t in self.closed_trades[:100]]
-            signals = list(self.signals)[:60]
+                      for t in eng.closed_trades[:100]]
+            signals = list(eng.signals)[:60]
+            wins = sum(1 for t in eng.closed_trades if t.get("pnl", 0) > 0)
+            closed_count = len(eng.closed_trades)
+            decide = list(eng._decide_ms)
+        return {
+            "name":           eng.name,
+            "label":          eng.label,
+            "hint":           ENGINE_HINTS[eng.name],
+            "config": {
+                "threshold_pct": eng.threshold_pct, "tp_pct": eng.tp_pct,
+                "block_long": eng.blocked[strategy.LONG], "block_short": eng.blocked[strategy.SHORT],
+            },
+            "signal_count":   eng.signal_count,
+            "opened_count":   eng.opened_count,
+            "closed_count":   closed_count,
+            "wins":           wins,
+            "realized_pnl":   eng.total_realized_pnl,
+            "unrealized_pnl": sum(p["pnl"] for p in positions),
+            "decide_ms":      round(sum(decide) / len(decide), 2) if decide else None,
+            "positions":      positions,
+            "closed_trades":  closed,
+            "signals":        signals,
+            "excursions":     self.excursion_stats(eng),
+            "evaluations":    self.evaluations(eng.threshold_pct),
+        }
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self.lock:
             events = list(self.events)[:80]
         ks = self.kline_stream.get_stats() if self.kline_stream else {}
         k1 = (ks.get("intervals") or {}).get(KLINE_INTERVAL, {})
         pc = self.price_cache
-        wins = sum(1 for t in self.closed_trades if t.get("pnl", 0) > 0)
         return {
             "mode":            "señales al executor",
             "running":         self.running,
             "uptime_s":        now - self.started_at,
             "config": {
-                "threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct,
                 "notional": NOTIONAL_USDT, "stop_loss": None, "cooldown_s": COOLDOWN_SECONDS,
                 "admin_token": bool(ADMIN_TOKEN),
-                "block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT],
             },
             "executor": {
                 "url": self.executor.target.url, "sent": self.executor.sent,
@@ -1025,27 +1156,18 @@ class KlineBot:
                 "last_ok": _utc(self.executor.last_ok_ts, "%H:%M:%S") if self.executor.last_ok_ts else "",
                 "http_ms": round(self.executor.last_http_ms, 1),
                 "total_ms": round(self.executor.last_total_ms, 1),
-                "decide_ms": round(sum(self._decide_ms) / len(self._decide_ms), 2) if self._decide_ms else None,
             },
             "klines": {
                 "symbols": k1.get("symbols", 0), "with_data": k1.get("with_data", 0),
                 "closed_candles": k1.get("closed_candles", 0),
+                "live_updates": self.live_updates,
                 "connections": ks.get("connections", 0), "active": ks.get("active_connections", 0),
                 "reconnects": ks.get("reconnects", 0), "last_error": ks.get("last_error", ""),
             },
             "prices_connected": bool(pc and pc.is_connected()),
-            "signal_count":    self.signal_count,
-            "opened_count":    self.opened_count,
-            "closed_count":    len(self.closed_trades),
-            "excursions":      self.excursion_stats(),
-            "wins":            wins,
-            "realized_pnl":    self.total_realized_pnl,
-            "unrealized_pnl":  sum(p["pnl"] for p in positions),
-            "positions":       positions,
-            "closed_trades":   closed,
-            "signals":         signals,
+            "eval_total":      self.eval_count,
+            "engines":         {n: self._engine_snapshot(e, now) for n, e in self.engines.items()},
             "events":          events,
-            "evaluations":     self.evaluations(),
             "last_error":      self.last_error,
             "persistence":     self.store.status(),
         }
@@ -1080,6 +1202,17 @@ def _guard():
     return None
 
 
+def _engine_param(data: Optional[dict] = None, default: Optional[str] = ENGINE_CLOSE):
+    """Bot pedido en el body (`engine`) o en la URL (?engine=). (Engine | None, error)."""
+    name = (data or {}).get("engine") or request.args.get("engine") or default
+    if name is None:
+        return None, None
+    eng = bot.engine(name)
+    if eng is None:
+        return None, (jsonify({"ok": False, "error": f"engine debe ser {' o '.join(bot.engines)}"}), 400)
+    return eng, None
+
+
 @app.get("/")
 def index():
     return _no_store(make_response(HTML.replace("__POLL_MS__", str(STATUS_POLL_MS))))
@@ -1098,7 +1231,7 @@ def api_executor_get():
 
 @app.post("/api/executor")
 def api_executor_set():
-    """Cambia el link del Executor en caliente. Body JSON:
+    """Cambia el link del Executor en caliente (común a los dos bots). Body JSON:
     {"url": "https://...", "secret": "opcional", "token": "si hay ADMIN_TOKEN"}.
     url vacío = dejar de mandar señales."""
     busy = _guard()
@@ -1117,17 +1250,26 @@ def api_executor_set():
 
 @app.get("/api/config")
 def api_config_get():
-    return _no_store(jsonify({"ok": True, "threshold_pct": bot.threshold_pct, "tp_pct": bot.tp_pct}))
+    """Parámetros de los dos bots, o de uno con ?engine=close|live."""
+    eng, err = _engine_param(default=None)
+    if err:
+        return err
+    engines = [eng] if eng else list(bot.engines.values())
+    return _no_store(jsonify({"ok": True, "engines": {e.name: e.settings() for e in engines}}))
 
 
 @app.post("/api/config")
 def api_config_set():
-    """Cambia en caliente el % de la señal y/o del TP. Body JSON:
-    {"threshold_pct": 3, "tp_pct": 2, "token": "si hay ADMIN_TOKEN"}."""
+    """Cambia en caliente el % de la señal y/o del TP de un bot. Body JSON:
+    {"engine": "close"|"live", "threshold_pct": 3, "tp_pct": 2, "token": "si hay ADMIN_TOKEN"}.
+    Sin engine se cambia el bot al cierre."""
     busy = _guard()
     if busy:
         return busy
     data = request.get_json(silent=True) or {}
+    eng, err = _engine_param(data)
+    if err:
+        return err
     vals = {}
     for key in ("threshold_pct", "tp_pct"):
         if data.get(key) in (None, ""):
@@ -1141,36 +1283,42 @@ def api_config_set():
         vals[key] = v
     if not vals:
         return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
-    return jsonify({"ok": True, **bot.set_config(**vals)})
+    return jsonify({"ok": True, **bot.set_config(eng, **vals)})
 
 
 @app.post("/api/block")
 def api_block():
-    """Bloquea/desbloquea entradas por dirección. Body JSON:
-    {"direction": "LONG"|"SHORT", "blocked": true|false}."""
+    """Bloquea/desbloquea entradas por dirección en un bot. Body JSON:
+    {"engine": "close"|"live", "direction": "LONG"|"SHORT", "blocked": true|false}."""
     busy = _guard()
     if busy:
         return busy
     data = request.get_json(silent=True) or {}
+    eng, err = _engine_param(data)
+    if err:
+        return err
     direction = str(data.get("direction", "")).upper()
     if direction not in (strategy.LONG, strategy.SHORT):
         return jsonify({"ok": False, "error": "direction debe ser LONG o SHORT"}), 400
-    return jsonify({"ok": True, **bot.set_block(direction, bool(data.get("blocked")))})
+    return jsonify({"ok": True, **bot.set_block(eng, direction, bool(data.get("blocked")))})
 
 
 @app.post("/api/close/<symbol>")
 def api_close(symbol: str):
-    """Cierre manual: /api/close/<trade_id> cierra esa posición;
-    /api/close/<SÍMBOLO> cierra todas las del par."""
+    """Cierre manual: /api/close/<trade_id> cierra esa posición (de cualquier
+    bot); /api/close/<SÍMBOLO> cierra todas las del par (?engine= limita a un bot)."""
     busy = _guard()
     if busy:
         return busy
+    eng, err = _engine_param(default=None)
+    if err:
+        return err
     if not bot.loop or not bot.loop.is_running():
         return jsonify({"ok": False, "error": "El loop del bot no está activo"}), 503
     symbol = symbol.upper().strip()
 
     async def _run():
-        return bot.close_manual(symbol)
+        return bot.close_manual(symbol, eng)
 
     try:
         ok, msg = asyncio.run_coroutine_threadsafe(_run(), bot.loop).result(timeout=10)
@@ -1179,16 +1327,27 @@ def api_close(symbol: str):
     return jsonify({"ok": ok, "symbol": symbol, "msg": msg}), (200 if ok else 404)
 
 
+def _trade_rows():
+    """Cierres del bot pedido con ?engine=, o de los dos (más reciente primero)."""
+    eng, err = _engine_param(default=None)
+    if err:
+        return None, err
+    with bot.lock:
+        engines = [eng] if eng else list(bot.engines.values())
+        rows = [r for e in engines for r in e.closed_trades]
+    rows.sort(key=lambda r: float(r.get("closed_at_ts") or 0), reverse=True)
+    return rows, None
+
+
 @app.get("/api/trades")
 def api_trades():
-    with bot.lock:
-        rows = list(bot.closed_trades)
-    return _no_store(jsonify(rows))
+    rows, err = _trade_rows()
+    return err or _no_store(jsonify(rows))
 
 
 TRADE_CSV_COLS = [
-    "trade_id", "symbol", "direction", "reason", "opened_ts", "closed_at_ts", "duration_s",
-    "signal_pct", "entry_price", "close_price", "qty", "notional", "tp_price", "move_pct",
+    "strategy", "trade_id", "symbol", "direction", "reason", "opened_ts", "closed_at_ts", "duration_s",
+    "signal_pct", "candle_age_s", "entry_price", "close_price", "qty", "notional", "tp_price", "move_pct",
     "pnl", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
     "time_to_mae_s", "high_price", "low_price",
 ]
@@ -1196,17 +1355,19 @@ TRADE_CSV_COLS = [
 
 @app.get("/api/trades.csv")
 def api_trades_csv():
-    """Historial con MFE/MAE para analizarlo en Excel o pandas."""
+    """Historial con MFE/MAE para analizarlo en Excel o pandas (?engine= para un bot)."""
+    rows, err = _trade_rows()
+    if err:
+        return err
     buf = io.StringIO()
     w = csv.writer(buf)
     w.writerow(TRADE_CSV_COLS)
-    with bot.lock:
-        rows = list(reversed(bot.closed_trades))
-    for r in rows:
-        w.writerow([r.get(c, "") for c in TRADE_CSV_COLS])
+    for r in reversed(rows):
+        w.writerow([r.get(c, "close" if c == "strategy" else "") for c in TRADE_CSV_COLS])
+    name = request.args.get("engine") or "todos"
     resp = make_response(buf.getvalue())
     resp.headers["Content-Type"] = "text/csv; charset=utf-8"
-    resp.headers["Content-Disposition"] = "attachment; filename=botkline_trades.csv"
+    resp.headers["Content-Disposition"] = f"attachment; filename=botkline_trades_{name}.csv"
     return _no_store(resp)
 
 
@@ -1214,7 +1375,8 @@ def api_trades_csv():
 def health():
     snap = bot.snapshot()
     return jsonify({
-        "ok": True, "running": bot.running, "positions": len(snap["positions"]),
+        "ok": True, "running": bot.running,
+        "positions": {n: len(e["positions"]) for n, e in snap["engines"].items()},
         "klines": snap["klines"], "prices_connected": snap["prices_connected"],
         "executor": snap["executor"]["url"], "persistence": snap["persistence"],
         "last_error": snap["last_error"],
@@ -1262,27 +1424,35 @@ HTML = r"""<!doctype html>
   input { flex:1 1 220px; background:#0e1630; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:inherit; }
   button { background:var(--blue); color:#06101f; border:0; border-radius:8px; padding:8px 14px; font-weight:700; cursor:pointer; }
   button.small { padding:4px 10px; font-size:12px; background:#2a3658; color:var(--txt); }
+  .tabs { display:flex; gap:8px; flex-wrap:wrap; margin:6px 0 14px; position:sticky; top:0; z-index:2;
+          background:var(--bg); padding:8px 0; }
+  .tabs button { background:#2a3658; color:var(--txt); font-size:14px; padding:10px 16px; }
+  .tabs button.on { background:var(--blue); color:#06101f; }
+  .tabs button * { pointer-events:none; }
+  tr.on td { background:rgba(96,165,250,.08); }
+  tr[data-engine] { cursor:pointer; }
   #exMsg { margin-top:8px; min-height:18px; }
   pre { margin:0; max-height:300px; overflow:auto; font-size:12px; color:var(--muted); white-space:pre-wrap; }
 </style>
 </head>
 <body>
 <main>
-  <h1>BOTKLINE <span class="muted" style="font-size:13px;font-weight:400">velas 1m · sigue la tendencia</span></h1>
+  <h1>BOTKLINE <span class="muted" style="font-size:13px;font-weight:400">velas 1m · dos bots en paralelo que siguen la tendencia</span></h1>
   <div class="muted" id="rules"></div>
 
   <div class="grid">
     <div class="card stat"><div class="label">Velas 1m</div><div class="v" id="sKl">—</div></div>
     <div class="card stat"><div class="label">Velas evaluadas</div><div class="v" id="sEval">—</div></div>
-    <div class="card stat"><div class="label">Señales / abiertas</div><div class="v" id="sSig">—</div></div>
-    <div class="card stat"><div class="label">Posiciones abiertas</div><div class="v" id="sPos">—</div></div>
-    <div class="card stat"><div class="label">PnL abierto</div><div class="v" id="sUpnl">—</div></div>
-    <div class="card stat"><div class="label">PnL realizado</div><div class="v" id="sRpnl">—</div></div>
+    <div class="card stat"><div class="label">PnL realizado (los dos)</div><div class="v" id="sRpnlAll">—</div></div>
     <div class="card stat"><div class="label">Estado</div><div class="v" id="sState">—</div></div>
   </div>
 
+  <div class="card"><h2>Los dos bots</h2><div class="scroll"><table>
+    <thead><tr><th>Bot</th><th>Entra</th><th>Señal</th><th>TP</th><th>Bloqueados</th><th>Señales / abiertas</th><th>Abiertas</th><th>Cerradas (gan.)</th><th>PnL abierto</th><th>PnL realizado</th></tr></thead>
+    <tbody id="tEng"></tbody></table></div></div>
+
   <div class="card">
-    <h2>Executor</h2>
+    <h2>Executor <span class="muted" style="font-size:12px;font-weight:400">(común a los dos bots)</span></h2>
     <div class="muted">Actual: <b id="exUrl">—</b> · enviadas <span id="exSent">0</span> · errores <span id="exErr">0</span></div>
     <div class="muted" id="exLat" style="margin-top:4px"></div>
     <form id="exForm" style="margin-top:10px">
@@ -1294,9 +1464,19 @@ HTML = r"""<!doctype html>
     <div id="exMsg" class="muted"></div>
   </div>
 
+  <div class="tabs" id="tabs"></div>
+  <div class="muted" id="engHint" style="margin:-6px 0 12px"></div>
+
+  <div class="grid">
+    <div class="card stat"><div class="label">Señales / abiertas</div><div class="v" id="sSig">—</div></div>
+    <div class="card stat"><div class="label">Posiciones abiertas</div><div class="v" id="sPos">—</div></div>
+    <div class="card stat"><div class="label">PnL abierto</div><div class="v" id="sUpnl">—</div></div>
+    <div class="card stat"><div class="label">PnL realizado</div><div class="v" id="sRpnl">—</div></div>
+  </div>
+
   <div class="card">
-    <h2>Parámetros (en caliente)</h2>
-    <div class="muted">Señal actual: <b id="cfgThr">—</b> · TP actual: <b id="cfgTp">—</b></div>
+    <h2>Parámetros · <span class="engName"></span> (en caliente)</h2>
+    <div class="muted">Señal actual: <b id="cfgThr">—</b> · TP actual: <b id="cfgTp">—</b> · <span id="engLat"></span></div>
     <form id="cfgForm" style="margin-top:10px">
       <input id="cfgNewThr" type="number" step="0.01" min="0.01" max="100" placeholder="% cuerpo de vela para entrar (ej. 3)">
       <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (ej. 2)">
@@ -1306,35 +1486,35 @@ HTML = r"""<!doctype html>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
       <button type="button" id="btnLong" data-block="LONG">LONG</button>
       <button type="button" id="btnShort" data-block="SHORT">SHORT</button>
-      <span class="muted" style="align-self:center">Bloquear una dirección frena solo las entradas nuevas; las abiertas siguen hasta su TP.</span>
+      <span class="muted" style="align-self:center">Solo afecta a este bot. Bloquear una dirección frena las entradas nuevas; las abiertas siguen hasta su TP.</span>
     </div>
   </div>
 
-  <div class="card"><h2>Posiciones abiertas</h2><div class="scroll"><table>
+  <div class="card"><h2>Posiciones abiertas · <span class="engName"></span></h2><div class="scroll"><table>
     <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>TP</th><th>Notional</th><th>PnL</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
     <tbody id="tPos"></tbody></table></div></div>
 
-  <div class="card"><h2>MFE / MAE de las cerradas <a class="muted" style="font-size:12px;font-weight:400" href="/api/trades.csv">descargar CSV</a></h2><div class="scroll"><table>
+  <div class="card"><h2>MFE / MAE de las cerradas · <span class="engName"></span> <a id="csvLink" class="muted" style="font-size:12px;font-weight:400" href="/api/trades.csv">descargar CSV</a></h2><div class="scroll"><table>
     <thead><tr><th>Dirección</th><th>Ops</th><th>Ganadas</th><th>MFE medio</th><th>MAE medio</th><th>Mejor MFE</th><th>Peor MAE</th><th>MAE medio USD</th><th>Hasta MAE</th><th>Duración media</th></tr></thead>
     <tbody id="tExc"></tbody></table></div></div>
 
-  <div class="card"><h2>Señales recientes</h2><div class="scroll"><table>
-    <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Cuerpo</th><th>Acción</th></tr></thead>
+  <div class="card"><h2>Señales recientes · <span class="engName"></span></h2><div class="scroll"><table>
+    <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Cuerpo</th><th>Segundo</th><th>Acción</th></tr></thead>
     <tbody id="tSig"></tbody></table></div></div>
 
-  <div class="card"><h2>Evaluaciones · mayores cuerpos de la vela <span id="evMin"></span></h2><div class="scroll"><table>
-    <thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Cuerpo</th><th>Señal</th></tr></thead>
-    <tbody id="tTop"></tbody></table></div></div>
-
-  <div class="card"><h2>Evaluaciones por minuto</h2><div class="scroll"><table>
-    <thead><tr><th>Vela</th><th>Evaluadas</th><th>≥ umbral (LONG)</th><th>≤ −umbral (SHORT)</th><th>Mayor subida</th><th>Mayor caída</th></tr></thead>
-    <tbody id="tMin"></tbody></table></div></div>
-
-  <div class="card"><h2>Operaciones cerradas</h2><div class="scroll"><table>
+  <div class="card"><h2>Operaciones cerradas · <span class="engName"></span></h2><div class="scroll"><table>
     <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
     <tbody id="tClosed"></tbody></table></div></div>
 
-  <div class="card"><h2>Eventos</h2><pre id="events"></pre></div>
+  <div class="card"><h2>Evaluaciones · mayores cuerpos de la vela cerrada <span id="evMin"></span></h2><div class="scroll"><table>
+    <thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Cuerpo</th><th>Señal con el umbral de <span class="engName"></span></th></tr></thead>
+    <tbody id="tTop"></tbody></table></div></div>
+
+  <div class="card"><h2>Evaluaciones por minuto <span class="muted" style="font-size:12px;font-weight:400">(cuerpo al cierre, con el umbral de <span class="engName"></span>)</span></h2><div class="scroll"><table>
+    <thead><tr><th>Vela</th><th>Evaluadas</th><th>≥ umbral (LONG)</th><th>≤ −umbral (SHORT)</th><th>Mayor subida</th><th>Mayor caída</th></tr></thead>
+    <tbody id="tMin"></tbody></table></div></div>
+
+  <div class="card"><h2>Eventos <span class="muted" style="font-size:12px;font-weight:400">(los dos bots)</span></h2><pre id="events"></pre></div>
 </main>
 <script>
 const q = id => document.getElementById(id);
@@ -1345,8 +1525,8 @@ const usd = v => `<span class="${v >= 0 ? 'pos' : 'neg'}">${v >= 0 ? '+' : ''}${
 const dur = s => { s = Math.floor(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
                    return h ? `${h}h ${m}m` : m ? `${m}m ${s%60}s` : `${s}s`; };
 const tag = d => `<span class="tag ${esc(d)}">${esc(d)}</span>`;
-let token = '';
-try { token = localStorage.getItem('botkline_token') || ''; } catch (e) {}
+let token = '', cur = 'close', last = null;
+try { token = localStorage.getItem('botkline_token') || ''; cur = localStorage.getItem('botkline_engine') || 'close'; } catch (e) {}
 q('exToken').value = token;
 
 function headers() {
@@ -1355,19 +1535,55 @@ function headers() {
   if (t) h['X-Admin-Token'] = t;
   return h;
 }
+function saveToken() { try { localStorage.setItem('botkline_token', q('exToken').value.trim()); } catch (e) {} }
 
 async function refresh() {
-  let d;
-  try { d = await (await fetch('/api/status', {cache: 'no-store'})).json(); } catch (e) { return; }
-  const c = d.config;
-  q('rules').textContent = `Cuerpo de la última vela ≥ ${c.threshold_pct}% → sigue la tendencia · TP ${c.tp_pct}% · ${c.notional} USDT · sin stop loss`;
+  try { last = await (await fetch('/api/status', {cache: 'no-store'})).json(); } catch (e) { return; }
+  render(last);
+}
+
+function render(d) {
+  const c = d.config, names = Object.keys(d.engines);
+  if (!d.engines[cur]) cur = names[0];
+  const e = d.engines[cur], ec = e.config;
+  q('rules').textContent = `Cuerpo de la vela 1m ≥ umbral → sigue la tendencia · ${c.notional} USDT por entrada · sin stop loss · cada bot con sus operaciones e historial`;
   q('exToken').style.display = c.admin_token ? '' : 'none';
   const k = d.klines;
   q('sKl').innerHTML = `${k.with_data}/${k.symbols} <span class="muted" style="font-size:12px">${k.active}/${k.connections} conex.</span>`;
-  const ev = d.evaluations;
-  q('sEval').textContent = ev.total.toLocaleString('es');
-  q('cfgThr').textContent = `±${c.threshold_pct}%`;
-  q('cfgTp').textContent = `${c.tp_pct}%`;
+  q('sEval').textContent = d.eval_total.toLocaleString('es');
+  q('sRpnlAll').innerHTML = usd(names.reduce((s, n) => s + d.engines[n].realized_pnl, 0));
+  const p = d.persistence || {};
+  q('sState').innerHTML = `<span class="${p.mode === 'ok' || p.mode === 'local' ? 'pos' : 'warn'}">${esc(p.mode)}</span>`;
+
+  q('tEng').innerHTML = names.map(n => { const x = d.engines[n], xc = x.config;
+    const bl = [xc.block_long && 'LONG', xc.block_short && 'SHORT'].filter(Boolean).join(', ');
+    return `<tr data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}"><td><b>${esc(x.label)}</b></td><td class="muted">${n === 'live' ? 'vela abierta' : 'al cierre'}</td>
+      <td>±${xc.threshold_pct}%</td><td>${xc.tp_pct}%</td><td class="${bl ? 'neg' : 'muted'}">${bl || 'ninguno'}</td>
+      <td>${x.signal_count} / ${x.opened_count}</td><td>${x.positions.length}</td><td>${x.closed_count} (${x.wins})</td>
+      <td>${usd(x.unrealized_pnl)}</td><td>${usd(x.realized_pnl)}</td></tr>`; }).join('');
+  q('tabs').innerHTML = names.map(n => { const x = d.engines[n];
+    return `<button type="button" data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}">${esc(x.label)} <span>· ${x.positions.length} abiertas · </span>${usd(x.realized_pnl)}</button>`; }).join('');
+  q('engHint').textContent = `${e.label}: ${e.hint}.`;
+  document.querySelectorAll('.engName').forEach(el => el.textContent = e.label);
+  q('csvLink').href = '/api/trades.csv?engine=' + encodeURIComponent(cur);
+
+  q('exUrl').textContent = d.executor.url || '(vacío: sin señales)';
+  q('exSent').textContent = d.executor.sent;
+  q('exErr').textContent = d.executor.errors;
+  const x = d.executor;
+  q('exLat').textContent = x.last_ok
+    ? `Última señal (${x.last_ok}): HTTP al executor ${x.http_ms} ms · total desde el mensaje de Binance ${x.total_ms} ms`
+    : 'Latencia: aún no hay señales enviadas';
+  q('engLat').textContent = e.decide_ms === null ? 'decisión: sin entradas aún' : `decisión media ${e.decide_ms} ms`;
+
+  q('cfgThr').textContent = `±${ec.threshold_pct}%`;
+  q('cfgTp').textContent = `${ec.tp_pct}%`;
+  q('sSig').textContent = `${e.signal_count} / ${e.opened_count}`;
+  q('sPos').textContent = e.positions.length;
+  q('sUpnl').innerHTML = usd(e.unrealized_pnl);
+  q('sRpnl').innerHTML = `${usd(e.realized_pnl)} <span class="muted" style="font-size:12px">${e.wins}/${e.closed_count} gan.</span>`;
+
+  const ev = e.evaluations;
   q('evMin').textContent = ev.top_minute;
   q('tTop').innerHTML = ev.top.map(r => `<tr><td>${esc(r.symbol)}</td><td>${num(r.open, 8)}</td><td>${num(r.close, 8)}</td>
     <td>${pct(r.body_pct)}</td><td>${r.signal ? tag(r.signal) : '<span class="muted">—</span>'}</td></tr>`).join('')
@@ -1375,50 +1591,38 @@ async function refresh() {
   q('tMin').innerHTML = ev.minutes.map(m => `<tr><td>${esc(m.minute)}</td><td>${m.evaluated}</td><td>${m.long}</td><td>${m.short}</td>
     <td>${pct(m.max_up)}</td><td>${pct(m.max_down)}</td></tr>`).join('')
     || '<tr><td colspan="6" class="muted">Sin evaluaciones todavía</td></tr>';
-  q('sSig').textContent = `${d.signal_count} / ${d.opened_count}`;
-  q('sPos').textContent = d.positions.length;
-  q('sUpnl').innerHTML = usd(d.unrealized_pnl);
-  q('sRpnl').innerHTML = `${usd(d.realized_pnl)} <span class="muted" style="font-size:12px">${d.wins}/${d.closed_count} gan.</span>`;
-  const p = d.persistence || {};
-  q('sState').innerHTML = `<span class="${p.mode === 'ok' || p.mode === 'local' ? 'pos' : 'warn'}">${esc(p.mode)}</span>`;
-  q('exUrl').textContent = d.executor.url || '(vacío: sin señales)';
-  q('exSent').textContent = d.executor.sent;
-  q('exErr').textContent = d.executor.errors;
-  const x = d.executor;
-  q('exLat').textContent = x.last_ok
-    ? `Última señal: decisión ${x.decide_ms ?? '—'} ms (media) · HTTP al executor ${x.http_ms} ms · total desde el cierre de Binance ${x.total_ms} ms`
-    : 'Latencia: aún no hay señales enviadas';
 
-  q('tPos').innerHTML = d.positions.map(r => `<tr>
+  q('tPos').innerHTML = e.positions.map(r => `<tr>
     <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span></td><td>${tag(r.direction)}</td>
-    <td>${pct(r.signal_pct)}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
+    <td>${pct(r.signal_pct)}${cur === 'live' ? ` <span class="muted">${Math.round(r.candle_age_s || 0)}s</span>` : ''}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
     <td>${pct(r.move_pct)}</td><td>${num(r.tp_price, 8)}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
     <td>${pct(r.mfe_pct)} <span class="muted">${usd(r.mfe_usd)}</span></td><td>${pct(r.mae_pct)} <span class="muted">${usd(r.mae_usd)}</span></td>
     <td>${esc(r.opened)} <span class="muted">(${dur(r.age_s)})</span></td>
     <td><button class="small" data-close="${r.trade_id}" data-label="${esc(r.direction)} ${esc(r.symbol)} #${r.trade_id}">Cerrar</button></td></tr>`).join('')
     || '<tr><td colspan="13" class="muted">Sin posiciones abiertas</td></tr>';
 
-  q('tSig').innerHTML = d.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
+  q('tSig').innerHTML = e.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
     <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
+    <td class="muted">${Math.round(s.candle_age_s || 0)}s</td>
     <td class="${s.action.startsWith('abierta') ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">Esperando velas con cuerpo ≥ umbral</td></tr>';
+    || `<tr><td colspan="7" class="muted">Esperando velas con cuerpo ≥ ±${ec.threshold_pct}%</td></tr>`;
 
-  q('tClosed').innerHTML = d.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
+  q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
     <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
     <td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
     <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}</td></tr>`).join('')
     || '<tr><td colspan="11" class="muted">Aún no hay cierres</td></tr>';
 
-  const ex = d.excursions;
-  q('tExc').innerHTML = ['all', 'LONG', 'SHORT'].map(k => {
-    const e = ex[k], label = k === 'all' ? 'Todas' : tag(k);
-    if (!e.n) return `<tr><td>${label}</td><td>0</td><td colspan="8" class="muted">—</td></tr>`;
-    return `<tr><td>${label}</td><td>${e.n}</td><td>${e.wins}</td><td>${pct(e.avg_mfe_pct)}</td><td>${pct(e.avg_mae_pct)}</td>
-      <td>${pct(e.best_mfe_pct)}</td><td>${pct(e.worst_mae_pct)}</td><td>${usd(e.avg_mae_usd)}</td>
-      <td>${dur(e.avg_time_to_mae_s)}</td><td>${dur(e.avg_duration_s)}</td></tr>`;
+  const exc = e.excursions;
+  q('tExc').innerHTML = ['all', 'LONG', 'SHORT'].map(kk => {
+    const r = exc[kk], label = kk === 'all' ? 'Todas' : tag(kk);
+    if (!r.n) return `<tr><td>${label}</td><td>0</td><td colspan="8" class="muted">—</td></tr>`;
+    return `<tr><td>${label}</td><td>${r.n}</td><td>${r.wins}</td><td>${pct(r.avg_mfe_pct)}</td><td>${pct(r.avg_mae_pct)}</td>
+      <td>${pct(r.best_mfe_pct)}</td><td>${pct(r.worst_mae_pct)}</td><td>${usd(r.avg_mae_usd)}</td>
+      <td>${dur(r.avg_time_to_mae_s)}</td><td>${dur(r.avg_duration_s)}</td></tr>`;
   }).join('');
 
-  for (const [id, dir, blocked] of [['btnLong', 'LONG', c.block_long], ['btnShort', 'SHORT', c.block_short]]) {
+  for (const [id, dir, blocked] of [['btnLong', 'LONG', ec.block_long], ['btnShort', 'SHORT', ec.block_short]]) {
     const b = q(id);
     b.dataset.blocked = blocked ? '1' : '';
     b.textContent = blocked ? `${dir} bloqueados · desbloquear` : `${dir} activos · bloquear`;
@@ -1433,8 +1637,8 @@ q('exForm').addEventListener('submit', async ev => {
   const body = {url: q('exNew').value.trim()};
   const secret = q('exSecret').value;
   if (secret) body.secret = secret;
-  try { localStorage.setItem('botkline_token', q('exToken').value.trim()); } catch (e) {}
-  if (!body.url && !confirm('Link vacío: el bot dejará de mandar señales. ¿Seguir?')) return;
+  saveToken();
+  if (!body.url && !confirm('Link vacío: los dos bots dejarán de mandar señales. ¿Seguir?')) return;
   q('exMsg').textContent = 'Guardando…';
   try {
     const r = await (await fetch('/api/executor', {method: 'POST', headers: headers(), body: JSON.stringify(body)})).json();
@@ -1448,13 +1652,13 @@ q('exForm').addEventListener('submit', async ev => {
 
 q('cfgForm').addEventListener('submit', async ev => {
   ev.preventDefault();
-  const body = {threshold_pct: q('cfgNewThr').value, tp_pct: q('cfgNewTp').value};
-  try { localStorage.setItem('botkline_token', q('exToken').value.trim()); } catch (e) {}
+  const body = {engine: cur, threshold_pct: q('cfgNewThr').value, tp_pct: q('cfgNewTp').value};
+  saveToken();
   q('cfgMsg').textContent = 'Guardando…';
   try {
     const r = await (await fetch('/api/config', {method: 'POST', headers: headers(), body: JSON.stringify(body)})).json();
     q('cfgMsg').innerHTML = r.ok
-      ? `<span class="pos">Guardado.</span> Señal ±${r.threshold_pct}% · TP ${r.tp_pct}%`
+      ? `<span class="pos">Guardado en ${esc(last && last.engines[r.engine] ? last.engines[r.engine].label : r.engine)}.</span> Señal ±${r.threshold_pct}% · TP ${r.tp_pct}%`
       : `<span class="neg">${esc(r.error)}</span>`;
     if (r.ok) { q('cfgNewThr').value = ''; q('cfgNewTp').value = ''; }
   } catch (e) { q('cfgMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
@@ -1462,12 +1666,20 @@ q('cfgForm').addEventListener('submit', async ev => {
 });
 
 document.addEventListener('click', async ev => {
+  const row = ev.target.closest && ev.target.closest('[data-engine]');
+  if (row) {
+    cur = row.dataset.engine;
+    try { localStorage.setItem('botkline_engine', cur); } catch (e) {}
+    q('cfgMsg').textContent = '';
+    if (last) render(last);
+    return;
+  }
   const dir = ev.target.dataset && ev.target.dataset.block;
   if (dir) {
-    try { localStorage.setItem('botkline_token', q('exToken').value.trim()); } catch (e) {}
+    saveToken();
     const blocked = !ev.target.dataset.blocked;
     try {
-      const r = await (await fetch('/api/block', {method: 'POST', headers: headers(), body: JSON.stringify({direction: dir, blocked})})).json();
+      const r = await (await fetch('/api/block', {method: 'POST', headers: headers(), body: JSON.stringify({engine: cur, direction: dir, blocked})})).json();
       if (!r.ok) alert(r.error);
     } catch (e) { alert(e); }
     refresh();
