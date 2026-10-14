@@ -11,6 +11,7 @@ Conexiones
   • Binance manda un mensaje de kline cada ~250 ms por símbolo. Los que no son
     de cierre ("x":false) se descartan con una búsqueda de texto ANTES de
     parsear el JSON, así que solo se parsea 1 mensaje por símbolo y periodo.
+    Con on_update (vela en curso) se parsean todos y se entregan los abiertos.
 
 Almacenamiento (buffer circular numpy, sin objetos Python por vela)
   Por intervalo hay un único bloque contiguo de memoria:
@@ -87,14 +88,18 @@ class Candle(NamedTuple):
         return self.close >= self.open
 
 
-def parse_kline_message(raw) -> Optional[tuple]:
-    """(symbol, interval, open_time, o, h, l, c, v) si `raw` es el CIERRE de una
-    vela; None en otro caso. Descarta las velas en formación sin parsear JSON."""
-    if isinstance(raw, (bytes, bytearray)):
-        if b'"x":true' not in raw:
+def parse_kline_message(raw, closed_only: bool = True) -> Optional[tuple]:
+    """Con closed_only=True: (symbol, interval, open_time, o, h, l, c, v) si `raw`
+    es el CIERRE de una vela; None en otro caso. Descarta las velas en formación
+    sin parsear JSON.
+    Con closed_only=False: también las velas en formación, con un 9.º campo
+    `closed` (bool)."""
+    if closed_only:
+        if isinstance(raw, (bytes, bytearray)):
+            if b'"x":true' not in raw:
+                return None
+        elif '"x":true' not in raw:
             return None
-    elif '"x":true' not in raw:
-        return None
     try:
         msg = _loads(raw)
     except Exception:
@@ -103,13 +108,15 @@ def parse_kline_message(raw) -> Optional[tuple]:
     if not isinstance(data, dict) or data.get("e") != "kline":
         return None
     k = data.get("k") or {}
-    if not k.get("x"):
+    closed = bool(k.get("x"))
+    if closed_only and not closed:
         return None
     try:
-        return (str(k["s"]).upper(), str(k["i"]), int(k["t"]), float(k["o"]),
-                float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]))
+        row = (str(k["s"]).upper(), str(k["i"]), int(k["t"]), float(k["o"]),
+               float(k["h"]), float(k["l"]), float(k["c"]), float(k["v"]))
     except (KeyError, TypeError, ValueError):
         return None
+    return row if closed_only else row + (closed,)
 
 
 class KlineRing:
@@ -276,7 +283,8 @@ class KlineWebSocketStream:
     def __init__(self, symbols: Iterable[str], intervals: Iterable[str] = ("1m",),
                  history: int = 2, dtype: str = "float64",
                  streams_per_conn: int = STREAMS_PER_CONN,
-                 on_close: Optional[Callable[[str, str, Candle], None]] = None) -> None:
+                 on_close: Optional[Callable[[str, str, Candle], None]] = None,
+                 on_update: Optional[Callable[[str, str, Candle], None]] = None) -> None:
         self.intervals = list(dict.fromkeys(intervals))
         symbols = sorted({s.upper() for s in symbols if s})
         self.rings: Dict[str, KlineRing] = {
@@ -285,6 +293,9 @@ class KlineWebSocketStream:
         }
         self.per_conn = max(1, min(int(streams_per_conn), MAX_STREAMS))
         self.on_close = on_close
+        # on_update: se llama con la vela EN FORMACIÓN (cada ~250 ms por símbolo).
+        # Si se define, se parsean todos los mensajes, no solo los cierres.
+        self.on_update = on_update
         self._conns: List[_Conn] = []
         self._lock = threading.Lock()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -353,17 +364,26 @@ class KlineWebSocketStream:
                     delay = 1.0
                     async for raw in ws:
                         conn.messages += 1
-                        p = parse_kline_message(raw)
+                        live_cb = self.on_update
+                        p = parse_kline_message(raw, closed_only=live_cb is None)
                         if p is None:
                             continue
                         ring = rings.get(p[1])
                         if ring is None:
                             continue
+                        if live_cb is not None:
+                            if not p[8]:
+                                try:
+                                    live_cb(p[0], p[1], Candle(p[2], p[2] + ring.interval_ms - 1, *p[3:8]))
+                                except Exception:
+                                    pass
+                                continue
+                            p = p[:8]
                         ring.add(p[0], p[2], p[3], p[4], p[5], p[6], p[7])
                         cb = self.on_close
                         if cb is not None:
                             try:
-                                cb(p[0], p[1], Candle(p[2], p[2] + ring.interval_ms - 1, *p[3:]))
+                                cb(p[0], p[1], Candle(p[2], p[2] + ring.interval_ms - 1, *p[3:8]))
                             except Exception:
                                 pass
                     if self.running:    # cierre limpio del servidor (p. ej. el corte de 24 h de Binance)

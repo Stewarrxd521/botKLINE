@@ -2,25 +2,38 @@
 
 Aplicación web para Render que vigila las velas de 1 minuto de **todos** los perpetuos USDT por WebSocket y manda señales de apertura y cierre al **Executor** externo, que es quien abre las órdenes en Binance.
 
+## Dos bots en paralelo
+
+En el mismo proceso y la misma web corren dos bots con la misma estrategia y distinto momento de entrada:
+
+| Bot | Entra | Nombre en la API |
+| --- | --- | --- |
+| **Bot al cierre** | cuando la vela 1m **cierra** con cuerpo ≥ umbral | `close` |
+| **Bot en vivo** | en cuanto la vela 1m **en curso** supera el umbral, sin esperar al cierre (Binance manda la vela abierta cada ~250 ms) | `live` |
+
+Cada bot tiene su umbral, su TP, sus bloqueos LONG/SHORT, sus posiciones, sus señales, su MFE/MAE y su historial. Comparten los WebSockets, el executor y la web. El bot en vivo entra una sola vez por símbolo y vela; si el umbral se cruza justo en el último tick, entra con el cierre. Como el bot en vivo parsea todos los mensajes de velas (no solo los cierres), usa algo más de CPU.
+
+En la web, las pestañas *Bot al cierre* / *Bot en vivo* eligen qué bot se ve y se configura; la tabla *Los dos bots* los compara. El executor y los eventos son comunes.
+
 ## Estrategia
 
 1. **Velas por WebSocket** (`kline_ws.py`): una conexión con `<símbolo>@kline_1m` de todos los perpetuos. Se guardan las dos últimas velas cerradas de cada símbolo. Sin REST.
-2. **Señal**: al cerrar cada vela se mide su cuerpo, `(cierre − apertura) / apertura`.
+2. **Señal**: se mide el cuerpo de la vela, `(cierre o último precio − apertura) / apertura` (al cierre para el bot al cierre; en cada actualización para el bot en vivo).
    - Sube **≥ 3 %** → abre **LONG**.
    - Baja **≥ 3 %** → abre **SHORT**.
 3. **Tamaño**: notional fijo de **5 USDT**. La cantidad se redondea hacia arriba al `stepSize` del par para no quedar por debajo del mínimo de Binance. Los pares que exigen más de 5 USDT, o cuyo `stepSize` obliga a más de 1,5× el notional, se saltan y quedan anotados en la tabla de señales.
-4. **Una posición por símbolo**: mientras esté abierta, las señales nuevas de ese símbolo se ignoran.
+4. **Varias posiciones por símbolo**: cada señal abre su propia posición aunque ya haya otras abiertas en ese par, en la misma dirección o en la contraria (cada una con su `trade_id`, su TP y su cierre). Solo se evita repetir la señal de una misma vela.
 5. **Salida**: se cierra cuando el precio avanza **2 % o más** a favor desde la entrada (precio en tiempo real de `WS.py`: bookTicker del símbolo + `!markPrice@arr`). **No hay stop loss**; solo cierre manual desde la web.
 
-Las cifras se configuran con variables de entorno (tabla abajo). El **% de la señal** y el **% del TP** también se cambian en caliente desde el bloque *Parámetros* de la web o con `POST /api/config` (`{"threshold_pct": 3, "tp_pct": 2}`). El umbral aplica desde la siguiente vela; el TP nuevo también se aplica a las posiciones abiertas. Los valores se guardan en `SETTINGS_FILE`.
+Las cifras se configuran con variables de entorno (tabla abajo). El **% de la señal** y el **% del TP** de cada bot también se cambian en caliente desde el bloque *Parámetros* de la web o con `POST /api/config` (`{"engine": "live", "threshold_pct": 3, "tp_pct": 2}`; sin `engine` se cambia el bot al cierre). El umbral aplica desde la siguiente señal; el TP nuevo también se aplica a las posiciones abiertas de ese bot. Los valores se guardan en `SETTINGS_FILE` (los ajustes de la versión anterior pasan al bot al cierre).
 
 ### Bloquear longs o shorts
 
-En el bloque *Parámetros* hay un botón por dirección (o `POST /api/block` con `{"direction": "LONG", "blocked": true}`). Una dirección bloqueada no abre entradas nuevas; sus señales aparecen como *bloqueada* en la tabla de señales. Las posiciones ya abiertas siguen hasta su TP o cierre manual. El estado se guarda en `SETTINGS_FILE`.
+En el bloque *Parámetros* de cada bot hay un botón por dirección (o `POST /api/block` con `{"engine": "close", "direction": "LONG", "blocked": true}`). Solo afecta a ese bot. Una dirección bloqueada no abre entradas nuevas; sus señales aparecen como *bloqueada* en la tabla de señales. Las posiciones ya abiertas siguen hasta su TP o cierre manual. El estado se guarda en `SETTINGS_FILE`.
 
 ### MFE / MAE
 
-Cada posición registra su máximo a favor (**MFE**) y su máximo en contra (**MAE**), en % y en USDT, con el momento en que se marcaron y el precio máximo y mínimo vistos. La web los muestra en las posiciones abiertas y en las cerradas, más un resumen (medias, mejor MFE, peor MAE, tiempo hasta el MAE) total y por dirección. `GET /api/trades.csv` descarga el historial completo con estas columnas.
+Cada posición registra su máximo a favor (**MFE**) y su máximo en contra (**MAE**), en % y en USDT, con el momento en que se marcaron y el precio máximo y mínimo vistos. La web los muestra en las posiciones abiertas y en las cerradas, más un resumen (medias, mejor MFE, peor MAE, tiempo hasta el MAE) total y por dirección. `GET /api/trades.csv?engine=close|live` descarga el historial de un bot con estas columnas (sin `engine`, los dos, con la columna `strategy`).
 
 ### Evaluaciones
 
@@ -28,22 +41,24 @@ La web muestra todas las velas evaluadas, no solo las que generan señal:
 - **Mayores cuerpos** de la última vela 1m cerrada (los `EVAL_TOP_N` primeros, por defecto 15), con la señal que daría con el umbral actual.
 - **Resumen por minuto** (últimos `EVAL_MINUTES_KEPT`, por defecto 30): velas evaluadas, cuántas pasaron el umbral en cada dirección y la mayor subida y caída.
 
+Se cuentan con el umbral del bot seleccionado y miden el cuerpo al cierre.
+
 ## Executor
 
 Cada apertura y cierre se manda con `POST <EXECUTOR_URL>/signal` y la cabecera `X-Signal-Secret`, con el mismo formato de antes:
 
 ```json
 {"action": "open",  "trade_id": 1791908572, "symbol": "FOOUSDT", "direction": "LONG",
- "price": 1.04, "quantity": 5, "notional": 5.2, "level": 4.0}
+ "price": 1.04, "quantity": 5, "notional": 5.2, "level": 4.0, "strategy": "live"}
 {"action": "close", "trade_id": 1791908572, "symbol": "FOOUSDT", "direction": "LONG",
- "reason": "TP", "close_price": 1.0609, "pnl": 0.1045}
+ "reason": "TP", "close_price": 1.0609, "pnl": 0.1045, "strategy": "live"}
 ```
 
-`direction` ahora puede ser `LONG` o `SHORT`, y `level` lleva el % del cuerpo de la vela que disparó la señal.
+`direction` puede ser `LONG` o `SHORT`, `level` lleva el % del cuerpo de la vela que disparó la señal y `strategy` dice qué bot la mandó (`close` o `live`). Los `trade_id` son únicos entre los dos bots, así que el executor puede tener a la vez una posición de cada bot en el mismo par.
 
 ### Latencia
 
-Las señales salen por conexiones HTTP persistentes (keep-alive): `EXECUTOR_WORKERS` hilos (4 por defecto) mantienen abierta su conexión con el executor y la refrescan con un `GET /api/state` cada `EXECUTOR_WARM_S` segundos (20) si no hay señales. Así cada señal paga solo el viaje de red, sin abrir TCP+TLS de nuevo. La entrada usa el cierre de la vela como precio. La web muestra, para la última señal, los ms de decisión, los ms del HTTP al executor y el total desde que llegó el cierre de Binance.
+Las señales salen por conexiones HTTP persistentes (keep-alive): `EXECUTOR_WORKERS` hilos (4 por defecto) mantienen abierta su conexión con el executor y la refrescan con un `GET /api/state` cada `EXECUTOR_WARM_S` segundos (20) si no hay señales. Así cada señal paga solo el viaje de red, sin abrir TCP+TLS de nuevo. La entrada usa el último precio de la vela. La web muestra los ms de decisión de cada bot y, para la última señal, los ms del HTTP al executor y el total desde que llegó el mensaje de Binance.
 
 ### Cambiar el link en caliente
 
@@ -63,11 +78,13 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 
 | Variable | Default | Descripción |
 | --- | --- | --- |
-| `SIGNAL_THRESHOLD_PCT` | `3` | Cuerpo mínimo de la vela 1m para abrir. |
-| `TAKE_PROFIT_PCT` | `2` | Avance a favor para cerrar. |
+| `SIGNAL_THRESHOLD_PCT` | `3` | Bot al cierre: cuerpo mínimo de la vela 1m para abrir. |
+| `TAKE_PROFIT_PCT` | `2` | Bot al cierre: avance a favor para cerrar. |
+| `LIVE_SIGNAL_THRESHOLD_PCT` | = `SIGNAL_THRESHOLD_PCT` | Bot en vivo: cuerpo de la vela en curso para abrir. |
+| `LIVE_TAKE_PROFIT_PCT` | = `TAKE_PROFIT_PCT` | Bot en vivo: avance a favor para cerrar. |
 | `NOTIONAL_USDT` | `5` | USDT por entrada. |
 | `MAX_NOTIONAL_OVER` | `1.5` | Si el redondeo al `stepSize` supera notional × esto, se salta el par. |
-| `COOLDOWN_SECONDS` | `0` | Pausa tras un cierre antes de volver a operar el símbolo. |
+| `COOLDOWN_SECONDS` | `0` | Pausa tras un cierre antes de que ese bot vuelva a operar el símbolo. |
 | `SIGNAL_MAX_DELAY_S` | `10` | Un cierre de vela que llega más tarde que esto no genera señal. |
 | `PRICE_MAX_AGE_S` | `5` | Antigüedad máxima del precio usado para el TP. |
 | `EXECUTOR_URL` | `https://executor-5lu0.onrender.com` | Link inicial del Executor (se puede cambiar desde la web). |
@@ -82,14 +99,14 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 
 | Ruta | Uso |
 | --- | --- |
-| `GET /` | Panel: posiciones, señales recientes, cierres, eventos y link del executor. |
-| `GET /api/status` | Estado completo en JSON. |
-| `GET/POST /api/executor` | Ver o cambiar el link del Executor. |
-| `GET/POST /api/config` | Ver o cambiar el % de la señal y del TP. |
-| `POST /api/close/<SÍMBOLO>` | Cierre manual. |
-| `GET /api/trades` | Historial de cierres. |
-| `GET /api/trades.csv` | Historial con MFE/MAE en CSV. |
-| `POST /api/block` | Bloquear o permitir LONG o SHORT. |
+| `GET /` | Panel con los dos bots: posiciones, señales, cierres, eventos y link del executor. |
+| `GET /api/status` | Estado completo en JSON (`engines.close` y `engines.live`). |
+| `GET/POST /api/executor` | Ver o cambiar el link del Executor (común). |
+| `GET/POST /api/config` | Ver o cambiar el % de la señal y del TP de un bot (`engine`). |
+| `POST /api/close/<trade_id>` | Cierre manual de una posición (`/api/close/<SÍMBOLO>?engine=live` cierra todas las del par en ese bot). |
+| `GET /api/trades?engine=` | Historial de cierres de un bot, o de los dos. |
+| `GET /api/trades.csv?engine=` | Historial con MFE/MAE en CSV. |
+| `POST /api/block` | Bloquear o permitir LONG o SHORT en un bot. |
 | `GET /health`, `GET /api/recovery` | Diagnóstico. |
 
 ## Ejecutar local
@@ -102,4 +119,4 @@ python -m pytest tests
 
 ## Deploy en Render
 
-`render.yaml` define el servicio y las variables. El código de la estrategia está en `strategy.py` (funciones puras, con pruebas en `tests/test_strategy.py`) y el bot en `app.py`.
+`render.yaml` define el servicio y las variables. El código de la estrategia está en `strategy.py` (funciones puras, con pruebas en `tests/test_strategy.py`) y los dos bots en `app.py`.
