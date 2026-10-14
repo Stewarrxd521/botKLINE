@@ -26,14 +26,19 @@ from __future__ import annotations
 import asyncio
 import atexit
 import concurrent.futures
+import csv
+import io
 import json
+import http.client
 import os
+import queue
 import sys
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
+from urllib.parse import urlsplit
 from collections import deque
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
@@ -87,6 +92,8 @@ EXECUTOR_URL    = os.getenv("EXECUTOR_URL", "https://executor-5lu0.onrender.com"
 EXECUTOR_SECRET = os.getenv("EXECUTOR_SECRET", "clave-secreta-aleatoria")
 # Si se define, los POST de la web (cambiar executor, cerrar) exigen este token.
 ADMIN_TOKEN     = os.getenv("ADMIN_TOKEN", "").strip()
+EXECUTOR_WORKERS = max(1, int(os.getenv("EXECUTOR_WORKERS", "4")))      # envíos en paralelo
+EXECUTOR_WARM_S  = float(os.getenv("EXECUTOR_WARM_S", "20"))            # GET para mantener viva la conexión
 
 # ── Persistencia ──────────────────────────────────────────────────────────────
 SETTINGS_FILE     = os.getenv("SETTINGS_FILE", os.path.join(_HERE, "bot_settings.json"))
@@ -132,6 +139,11 @@ class ExecutorBridge:
         self.errors = 0
         self.last_error = ""
         self.last_ok_ts = 0.0
+        self.last_http_ms = 0.0
+        self.last_total_ms = 0.0
+        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        self._workers: List[threading.Thread] = []
+        self._start_lock = threading.Lock()
 
     @staticmethod
     def clean_url(url: str) -> str:
@@ -148,36 +160,109 @@ class ExecutorBridge:
         except Exception:
             pass
 
-    def send_sync(self, payload: dict, target: ExecutorTarget) -> bool:
+    # ── Envío con conexiones persistentes ────────────────────────────────────
+    # Abrir TCP+TLS por cada señal cuesta 100-300 ms hasta Render. Cada hilo
+    # trabajador mantiene su conexión abierta (keep-alive) y la "calienta" con
+    # un GET cada EXECUTOR_WARM_S si está ociosa, así una señal sale en el RTT.
+
+    def _ensure_workers(self) -> None:
+        if self._workers:
+            return
+        with self._start_lock:
+            if self._workers:
+                return
+            for i in range(EXECUTOR_WORKERS):
+                t = threading.Thread(target=self._worker, daemon=True, name=f"executor-{i}")
+                t.start()
+                self._workers.append(t)
+
+    def _warm_conn(self, conns: dict) -> None:
+        target = self.target
         if not target.url:
-            return False
-        req = urllib.request.Request(
-            f"{target.url}/signal",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "X-Signal-Secret": target.secret},
-            method="POST",
-        )
+            return
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                resp.read()
-            self.sent += 1
-            self.last_ok_ts = time.time()
-            self._log(f"[executor] ✓ {payload.get('action')} {payload.get('symbol')} "
-                      f"{payload.get('direction')} → {target.url}")
-            return True
+            self._request(conns, target, "GET", "/api/state", None, retry=False)
+        except Exception:
+            pass                        # la próxima señal abrirá una conexión nueva
+
+    def _worker(self) -> None:
+        conns: Dict[Tuple[str, str], http.client.HTTPConnection] = {}
+        self._warm_conn(conns)          # conexión lista antes de la primera señal
+        while True:
+            try:
+                item = self._queue.get(timeout=EXECUTOR_WARM_S)
+            except queue.Empty:
+                self._warm_conn(conns)
+                continue
+            payload, target, t0 = item
+            self._deliver(conns, payload, target, t0)
+
+    def _request(self, conns: dict, target: ExecutorTarget, method: str, path: str,
+                 body: Optional[bytes], retry: bool = True) -> Tuple[int, bytes]:
+        u = urlsplit(target.url)
+        key = (u.scheme, u.netloc)
+        full = (u.path or "") + path
+        headers = {"Content-Type": "application/json", "X-Signal-Secret": target.secret,
+                   "Connection": "keep-alive"}
+        for attempt in range(2):
+            conn = conns.get(key)
+            reused = conn is not None
+            if conn is None:
+                cls = http.client.HTTPSConnection if u.scheme == "https" else http.client.HTTPConnection
+                conn = cls(u.hostname, u.port, timeout=self.timeout)
+                conns[key] = conn
+            try:
+                conn.request(method, full, body=body, headers=headers)
+                resp = conn.getresponse()
+                return resp.status, resp.read()
+            except (http.client.HTTPException, OSError):
+                conn.close()
+                conns.pop(key, None)
+                # Una conexión reutilizada que el servidor ya cerró falla antes de
+                # entregar la petición: se reintenta UNA vez con conexión nueva.
+                # Una conexión nueva que falla no se reintenta (evita duplicados).
+                if attempt == 0 and reused and retry:
+                    continue
+                raise
+        raise RuntimeError("sin conexión")
+
+    def _deliver(self, conns: dict, payload: dict, target: ExecutorTarget, t0: float) -> bool:
+        what = f"{payload.get('action')} {payload.get('symbol')} {payload.get('direction')}"
+        t_send = time.perf_counter()
+        try:
+            status, data = self._request(conns, target, "POST", "/signal",
+                                         json.dumps(payload).encode("utf-8"))
+            if status >= 400:
+                raise RuntimeError(f"HTTP {status}: {data[:200].decode('utf-8', 'replace')}")
         except Exception as exc:
             self.errors += 1
-            self.last_error = f"{payload.get('action')} {payload.get('symbol')}: {exc}"
+            self.last_error = f"{what}: {exc}"
             self._log(f"[executor] ✗ error enviando {self.last_error} → {target.url}")
             return False
+        now = time.perf_counter()
+        http_ms = (now - t_send) * 1000
+        total_ms = (now - t0) * 1000 if t0 else http_ms
+        self.sent += 1
+        self.last_ok_ts = time.time()
+        self.last_http_ms = http_ms
+        self.last_total_ms = total_ms
+        since = f" | desde el cierre de la vela {total_ms:.0f} ms" if t0 else ""
+        self._log(f"[executor] ✓ {what} → {target.url} | HTTP {http_ms:.0f} ms{since}")
+        return True
 
-    def send(self, payload: dict) -> None:
-        """No bloquea: el envío va en un hilo con el destino vigente AHORA."""
+    def send(self, payload: dict, t0: float = 0.0) -> None:
+        """No bloquea: encola la señal con el destino vigente AHORA.
+        t0 = perf_counter() del mensaje de Binance que la originó (para medir)."""
         target = self.target
         if not target.url:
             self._log(f"[executor] sin URL: no se envía {payload.get('action')} {payload.get('symbol')}")
             return
-        threading.Thread(target=self.send_sync, args=(payload, target), daemon=True).start()
+        self._ensure_workers()
+        self._queue.put((payload, target, t0))
+
+    def warm(self) -> None:
+        """Arranca los hilos y abre las conexiones antes de la primera señal."""
+        self._ensure_workers()
 
     def probe(self, url: str) -> Tuple[bool, str]:
         """GET <url>/api/state para comprobar que el Executor responde."""
@@ -210,14 +295,31 @@ class Position:
     candle_time: int            # open_time (ms) de esa vela
     opened_ts:   float = field(default_factory=time.time)
     last_price:  float = 0.0
-    mfe_pct:     float = 0.0    # mejor avance a favor visto
-    mae_pct:     float = 0.0    # peor retroceso en contra visto
+    # ── Excursiones (MFE = máximo a favor, MAE = máximo en contra) ──
+    mfe_pct:     float = 0.0    # mejor avance a favor visto (≥ 0)
+    mae_pct:     float = 0.0    # peor retroceso en contra visto (≤ 0)
+    mfe_usd:     float = 0.0
+    mae_usd:     float = 0.0
+    mfe_ts:      float = 0.0    # cuándo se marcó cada extremo
+    mae_ts:      float = 0.0
+    high_price:  float = 0.0    # precio máximo y mínimo vistos
+    low_price:   float = 0.0
 
     def update(self, price: float) -> float:
+        """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
         self.last_price = price
         move = strategy.favorable_move_pct(price, self.entry_price, self.direction)
-        self.mfe_pct = max(self.mfe_pct, move)
-        self.mae_pct = min(self.mae_pct, move)
+        now = time.time()
+        if move > self.mfe_pct:
+            self.mfe_pct, self.mfe_ts = move, now
+            self.mfe_usd = strategy.pnl_usd(price, self.entry_price, self.qty, self.direction)
+        if move < self.mae_pct:
+            self.mae_pct, self.mae_ts = move, now
+            self.mae_usd = strategy.pnl_usd(price, self.entry_price, self.qty, self.direction)
+        if price > self.high_price:
+            self.high_price = price
+        if self.low_price <= 0 or price < self.low_price:
+            self.low_price = price
         return move
 
 
@@ -267,12 +369,16 @@ class KlineBot:
         # Parámetros editables en caliente desde la web (POST /api/config).
         self.threshold_pct = float(settings.get("threshold_pct") or SIGNAL_THRESHOLD_PCT)
         self.tp_pct = float(settings.get("tp_pct") or TAKE_PROFIT_PCT)
+        # Bloqueo manual por dirección (botones de la web): no abre nuevas entradas.
+        self.blocked = {strategy.LONG: bool(settings.get("block_long")),
+                        strategy.SHORT: bool(settings.get("block_short"))}
 
         # Evaluaciones: cada cierre de vela 1m se mide, pase o no el umbral.
         # minuto (open_time ms) → [(cuerpo %, símbolo, apertura, cierre), ...]
         self._evals: Dict[int, List[Tuple[float, str, float, float]]] = {}
         self._evals_lock = threading.Lock()
         self.eval_count = 0
+        self._decide_ms: Deque[float] = deque(maxlen=200)    # cierre recibido → señal encolada
 
         # Upstash desactivado por ahora: solo copia local (backend=None).
         self._store_desc = f"solo disco local ({RECOVERY_FILE})"
@@ -316,7 +422,8 @@ class KlineBot:
         t = self.executor.target
         data = {"executor_url": t.url, "executor_secret": t.secret,
                 "executor_changed_ts": self.executor_changed_ts,
-                "threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct}
+                "threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct,
+                "block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT]}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -346,6 +453,15 @@ class KlineBot:
             self.store.mark_dirty(True)
             self.log("[config] " + " | ".join(changes))
         return {"threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct}
+
+    def set_block(self, direction: str, blocked: bool) -> dict:
+        """Bloquea o desbloquea las entradas nuevas de una dirección. Las
+        posiciones ya abiertas siguen su curso (TP o cierre manual)."""
+        if self.blocked[direction] != blocked:
+            self.blocked[direction] = blocked
+            self._save_settings()
+            self.log(f"[config] {direction}: {'BLOQUEADOS' if blocked else 'permitidos'}")
+        return {"block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT]}
 
     def set_executor(self, url: str, secret: Optional[str] = None) -> ExecutorTarget:
         """Cambia el destino de las señales en caliente (sin reiniciar)."""
@@ -384,6 +500,7 @@ class KlineBot:
                  f"executor → {self.executor.target.url or '(vacío)'}")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
+        self.executor.warm()
         await self._init_symbols()
 
         # El estado (posiciones abiertas) se restaura ANTES de abrir los WebSockets.
@@ -509,7 +626,8 @@ class KlineBot:
             return
         loop = self.loop
         if loop is not None:
-            loop.call_soon_threadsafe(self._handle_signal, symbol, direction, candle, time.time())
+            loop.call_soon_threadsafe(self._handle_signal, symbol, direction, candle, time.time(),
+                                      time.perf_counter())
 
     def _record_eval(self, symbol: str, candle: Candle) -> None:
         body = strategy.body_change_pct(candle.open, candle.close)
@@ -564,7 +682,8 @@ class KlineBot:
             "action":    action,
         })
 
-    def _handle_signal(self, symbol: str, direction: str, candle: Candle, arrived: float) -> None:
+    def _handle_signal(self, symbol: str, direction: str, candle: Candle, arrived: float,
+                       t0: float = 0.0) -> None:
         """Corre en el loop del bot. Decide si abrir y lanza la apertura."""
         if self._last_candle.get(symbol, -1) >= candle.open_time:
             return                                          # duplicado tras reconexión
@@ -575,6 +694,9 @@ class KlineBot:
         delay = arrived - candle.close_time / 1000
         if delay > SIGNAL_MAX_DELAY_S:
             self._record_signal(symbol, direction, candle, f"ignorada: llegó {delay:.0f}s tarde")
+            return
+        if self.blocked.get(direction):
+            self._record_signal(symbol, direction, candle, f"bloqueada: {direction} desactivados")
             return
         if not self.store.can_open():
             self._record_signal(symbol, direction, candle, "ignorada: estado sin confirmar")
@@ -589,7 +711,9 @@ class KlineBot:
             self._record_signal(symbol, direction, candle, "ignorada: en pausa tras cierre")
             return
 
-        price = self._price(symbol) or candle.close
+        # El cierre de la vela es el último trade: más fresco que el mark price
+        # (1-3 s) que hay para los símbolos sin bookTicker suscrito.
+        price = candle.close
         f = self.filters.get(symbol, {})
         qty, eff, why = strategy.size_order(
             NOTIONAL_USDT, price, f.get("stepSize", 0.001), f.get("minQty", 0.0),
@@ -613,7 +737,8 @@ class KlineBot:
         if self.price_cache is not None:
             self.price_cache.ensure_symbols([symbol])       # bookTicker en tiempo real
         self.store.mark_dirty(True)
-        self._record_signal(symbol, direction, candle, f"abierta #{pos.trade_id}")
+        decide_ms = (time.perf_counter() - t0) * 1000 if t0 else 0.0
+        self._record_signal(symbol, direction, candle, f"abierta #{pos.trade_id} en {decide_ms:.1f} ms")
         self.log(f"ABRE {direction} {symbol} | vela {candle.open:g}→{candle.close:g} ({body:+.2f}%) | "
                  f"px={price:g} qty={qty:g} ({eff:.2f} USDT) | TP {pos.tp_price:g} | trade #{pos.trade_id}")
         self.executor.send({
@@ -625,7 +750,8 @@ class KlineBot:
             "quantity":  qty,
             "notional":  round(eff, 4),
             "level":     round(body, 4),
-        })
+        }, t0)
+        self._decide_ms.append(decide_ms)
 
     # ── Salidas: ticks de precio (hilo del WS de precios) ─────────────────────
 
@@ -696,7 +822,10 @@ class KlineBot:
                     "duration_s": now - pos.opened_ts,
                     "move_pct": strategy.favorable_move_pct(price, pos.entry_price, pos.direction),
                     "pnl": pnl,
+                    "pnl_pct": pnl / pos.notional * 100.0 if pos.notional else 0.0,
                     "reason": reason,
+                    "time_to_mfe_s": (pos.mfe_ts - pos.opened_ts) if pos.mfe_ts else 0.0,
+                    "time_to_mae_s": (pos.mae_ts - pos.opened_ts) if pos.mae_ts else 0.0,
                 }
                 self.total_realized_pnl += pnl
                 self.closed_trades.insert(0, rec)
@@ -818,6 +947,32 @@ class KlineBot:
 
     # ── Vista para la web ─────────────────────────────────────────────────────
 
+    def excursion_stats(self) -> dict:
+        """MFE/MAE agregados de las operaciones cerradas, total y por dirección."""
+        with self.lock:
+            rows = list(self.closed_trades)
+
+        def agg(rs: List[dict]) -> dict:
+            n = len(rs)
+            if not n:
+                return {"n": 0}
+            avg = lambda k: sum(float(r.get(k) or 0) for r in rs) / n   # noqa: E731
+            return {
+                "n": n,
+                "wins": sum(1 for r in rs if (r.get("pnl") or 0) > 0),
+                "avg_mfe_pct": avg("mfe_pct"), "avg_mae_pct": avg("mae_pct"),
+                "worst_mae_pct": min(float(r.get("mae_pct") or 0) for r in rs),
+                "best_mfe_pct": max(float(r.get("mfe_pct") or 0) for r in rs),
+                "avg_mae_usd": avg("mae_usd"),
+                "avg_duration_s": avg("duration_s"),
+                "avg_time_to_mae_s": avg("time_to_mae_s"),
+            }
+        return {
+            "all": agg(rows),
+            "LONG": agg([r for r in rows if r.get("direction") == strategy.LONG]),
+            "SHORT": agg([r for r in rows if r.get("direction") == strategy.SHORT]),
+        }
+
     def snapshot(self) -> dict:
         now = time.time()
         with self.lock:
@@ -848,11 +1003,15 @@ class KlineBot:
                 "threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct,
                 "notional": NOTIONAL_USDT, "stop_loss": None, "cooldown_s": COOLDOWN_SECONDS,
                 "admin_token": bool(ADMIN_TOKEN),
+                "block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT],
             },
             "executor": {
                 "url": self.executor.target.url, "sent": self.executor.sent,
                 "errors": self.executor.errors, "last_error": self.executor.last_error,
                 "last_ok": _utc(self.executor.last_ok_ts, "%H:%M:%S") if self.executor.last_ok_ts else "",
+                "http_ms": round(self.executor.last_http_ms, 1),
+                "total_ms": round(self.executor.last_total_ms, 1),
+                "decide_ms": round(sum(self._decide_ms) / len(self._decide_ms), 2) if self._decide_ms else None,
             },
             "klines": {
                 "symbols": k1.get("symbols", 0), "with_data": k1.get("with_data", 0),
@@ -864,6 +1023,7 @@ class KlineBot:
             "signal_count":    self.signal_count,
             "opened_count":    self.opened_count,
             "closed_count":    len(self.closed_trades),
+            "excursions":      self.excursion_stats(),
             "wins":            wins,
             "realized_pnl":    self.total_realized_pnl,
             "unrealized_pnl":  sum(p["pnl"] for p in positions),
@@ -970,6 +1130,20 @@ def api_config_set():
     return jsonify({"ok": True, **bot.set_config(**vals)})
 
 
+@app.post("/api/block")
+def api_block():
+    """Bloquea/desbloquea entradas por dirección. Body JSON:
+    {"direction": "LONG"|"SHORT", "blocked": true|false}."""
+    busy = _guard()
+    if busy:
+        return busy
+    data = request.get_json(silent=True) or {}
+    direction = str(data.get("direction", "")).upper()
+    if direction not in (strategy.LONG, strategy.SHORT):
+        return jsonify({"ok": False, "error": "direction debe ser LONG o SHORT"}), 400
+    return jsonify({"ok": True, **bot.set_block(direction, bool(data.get("blocked")))})
+
+
 @app.post("/api/close/<symbol>")
 def api_close(symbol: str):
     busy = _guard()
@@ -994,6 +1168,30 @@ def api_trades():
     with bot.lock:
         rows = list(bot.closed_trades)
     return _no_store(jsonify(rows))
+
+
+TRADE_CSV_COLS = [
+    "trade_id", "symbol", "direction", "reason", "opened_ts", "closed_at_ts", "duration_s",
+    "signal_pct", "entry_price", "close_price", "qty", "notional", "tp_price", "move_pct",
+    "pnl", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
+    "time_to_mae_s", "high_price", "low_price",
+]
+
+
+@app.get("/api/trades.csv")
+def api_trades_csv():
+    """Historial con MFE/MAE para analizarlo en Excel o pandas."""
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(TRADE_CSV_COLS)
+    with bot.lock:
+        rows = list(reversed(bot.closed_trades))
+    for r in rows:
+        w.writerow([r.get(c, "") for c in TRADE_CSV_COLS])
+    resp = make_response(buf.getvalue())
+    resp.headers["Content-Type"] = "text/csv; charset=utf-8"
+    resp.headers["Content-Disposition"] = "attachment; filename=botkline_trades.csv"
+    return _no_store(resp)
 
 
 @app.get("/health")
@@ -1070,6 +1268,7 @@ HTML = r"""<!doctype html>
   <div class="card">
     <h2>Executor</h2>
     <div class="muted">Actual: <b id="exUrl">—</b> · enviadas <span id="exSent">0</span> · errores <span id="exErr">0</span></div>
+    <div class="muted" id="exLat" style="margin-top:4px"></div>
     <form id="exForm" style="margin-top:10px">
       <input id="exNew" type="url" placeholder="https://mi-executor.onrender.com" autocomplete="off">
       <input id="exSecret" type="password" placeholder="Secreto (opcional, vacío = mantener)" autocomplete="off">
@@ -1088,11 +1287,20 @@ HTML = r"""<!doctype html>
       <button type="submit">Guardar</button>
     </form>
     <div id="cfgMsg" class="muted" style="margin-top:8px;min-height:18px"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
+      <button type="button" id="btnLong" data-block="LONG">LONG</button>
+      <button type="button" id="btnShort" data-block="SHORT">SHORT</button>
+      <span class="muted" style="align-self:center">Bloquear una dirección frena solo las entradas nuevas; las abiertas siguen hasta su TP.</span>
+    </div>
   </div>
 
   <div class="card"><h2>Posiciones abiertas</h2><div class="scroll"><table>
-    <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>TP</th><th>Notional</th><th>PnL</th><th>Abierta</th><th></th></tr></thead>
+    <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>TP</th><th>Notional</th><th>PnL</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
     <tbody id="tPos"></tbody></table></div></div>
+
+  <div class="card"><h2>MFE / MAE de las cerradas <a class="muted" style="font-size:12px;font-weight:400" href="/api/trades.csv">descargar CSV</a></h2><div class="scroll"><table>
+    <thead><tr><th>Dirección</th><th>Ops</th><th>Ganadas</th><th>MFE medio</th><th>MAE medio</th><th>Mejor MFE</th><th>Peor MAE</th><th>MAE medio USD</th><th>Hasta MAE</th><th>Duración media</th></tr></thead>
+    <tbody id="tExc"></tbody></table></div></div>
 
   <div class="card"><h2>Señales recientes</h2><div class="scroll"><table>
     <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Cuerpo</th><th>Acción</th></tr></thead>
@@ -1107,7 +1315,7 @@ HTML = r"""<!doctype html>
     <tbody id="tMin"></tbody></table></div></div>
 
   <div class="card"><h2>Operaciones cerradas</h2><div class="scroll"><table>
-    <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL</th><th>Duración</th><th>Motivo</th></tr></thead>
+    <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
     <tbody id="tClosed"></tbody></table></div></div>
 
   <div class="card"><h2>Eventos</h2><pre id="events"></pre></div>
@@ -1160,14 +1368,19 @@ async function refresh() {
   q('exUrl').textContent = d.executor.url || '(vacío: sin señales)';
   q('exSent').textContent = d.executor.sent;
   q('exErr').textContent = d.executor.errors;
+  const x = d.executor;
+  q('exLat').textContent = x.last_ok
+    ? `Última señal: decisión ${x.decide_ms ?? '—'} ms (media) · HTTP al executor ${x.http_ms} ms · total desde el cierre de Binance ${x.total_ms} ms`
+    : 'Latencia: aún no hay señales enviadas';
 
   q('tPos').innerHTML = d.positions.map(r => `<tr>
     <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span></td><td>${tag(r.direction)}</td>
     <td>${pct(r.signal_pct)}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
     <td>${pct(r.move_pct)}</td><td>${num(r.tp_price, 8)}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
+    <td>${pct(r.mfe_pct)} <span class="muted">${usd(r.mfe_usd)}</span></td><td>${pct(r.mae_pct)} <span class="muted">${usd(r.mae_usd)}</span></td>
     <td>${esc(r.opened)} <span class="muted">(${dur(r.age_s)})</span></td>
     <td><button class="small" data-close="${esc(r.symbol)}">Cerrar</button></td></tr>`).join('')
-    || '<tr><td colspan="11" class="muted">Sin posiciones abiertas</td></tr>';
+    || '<tr><td colspan="13" class="muted">Sin posiciones abiertas</td></tr>';
 
   q('tSig').innerHTML = d.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
     <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
@@ -1176,8 +1389,25 @@ async function refresh() {
 
   q('tClosed').innerHTML = d.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
     <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
+    <td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
     <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}</td></tr>`).join('')
-    || '<tr><td colspan="9" class="muted">Aún no hay cierres</td></tr>';
+    || '<tr><td colspan="11" class="muted">Aún no hay cierres</td></tr>';
+
+  const ex = d.excursions;
+  q('tExc').innerHTML = ['all', 'LONG', 'SHORT'].map(k => {
+    const e = ex[k], label = k === 'all' ? 'Todas' : tag(k);
+    if (!e.n) return `<tr><td>${label}</td><td>0</td><td colspan="8" class="muted">—</td></tr>`;
+    return `<tr><td>${label}</td><td>${e.n}</td><td>${e.wins}</td><td>${pct(e.avg_mfe_pct)}</td><td>${pct(e.avg_mae_pct)}</td>
+      <td>${pct(e.best_mfe_pct)}</td><td>${pct(e.worst_mae_pct)}</td><td>${usd(e.avg_mae_usd)}</td>
+      <td>${dur(e.avg_time_to_mae_s)}</td><td>${dur(e.avg_duration_s)}</td></tr>`;
+  }).join('');
+
+  for (const [id, dir, blocked] of [['btnLong', 'LONG', c.block_long], ['btnShort', 'SHORT', c.block_short]]) {
+    const b = q(id);
+    b.dataset.blocked = blocked ? '1' : '';
+    b.textContent = blocked ? `${dir} bloqueados · desbloquear` : `${dir} activos · bloquear`;
+    b.style.background = blocked ? 'var(--red)' : 'var(--green)';
+  }
 
   q('events').textContent = d.events.join('\n');
 }
@@ -1216,6 +1446,17 @@ q('cfgForm').addEventListener('submit', async ev => {
 });
 
 document.addEventListener('click', async ev => {
+  const dir = ev.target.dataset && ev.target.dataset.block;
+  if (dir) {
+    try { localStorage.setItem('botkline_token', q('exToken').value.trim()); } catch (e) {}
+    const blocked = !ev.target.dataset.blocked;
+    try {
+      const r = await (await fetch('/api/block', {method: 'POST', headers: headers(), body: JSON.stringify({direction: dir, blocked})})).json();
+      if (!r.ok) alert(r.error);
+    } catch (e) { alert(e); }
+    refresh();
+    return;
+  }
   const sym = ev.target.dataset && ev.target.dataset.close;
   if (!sym || !confirm(`¿Cerrar ${sym} a mercado?`)) return;
   try {
