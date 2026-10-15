@@ -4,6 +4,10 @@ strategy.py — Reglas puras de la estrategia (sin red ni estado), fáciles de p
   Señal   cuerpo de la última vela 1m cerrada = (cierre - apertura) / apertura.
           ≥ +UMBRAL% → LONG  |  ≤ -UMBRAL% → SHORT (se sigue la tendencia).
   Salida  el precio avanza TP% a favor desde la entrada. Sin stop loss.
+  Modo invertido (botón de la web): la señal va AL REVÉS (vela verde → SHORT,
+          roja → LONG) y el mismo % funciona como STOP LOSS; no hay TP.
+  Fees    el PnL neto resta la comisión de entrada y la de salida
+          (fee_pct % del notional en cada lado).
   Tamaño  notional fijo (5 USDT), redondeando la cantidad HACIA ARRIBA al
           stepSize para no quedar por debajo del mínimo de Binance.
 """
@@ -34,6 +38,15 @@ def signal_direction(open_: float, close: float, threshold_pct: float) -> Option
     return None
 
 
+def entry_direction(open_: float, close: float, threshold_pct: float,
+                    inverted: bool = False) -> Optional[str]:
+    """Dirección de la entrada: la de la vela, o la contraria en modo invertido."""
+    d = signal_direction(open_, close, threshold_pct)
+    if d is None or not inverted:
+        return d
+    return SHORT if d == LONG else LONG
+
+
 def favorable_move_pct(price: float, entry: float, direction: str) -> float:
     """Cuánto se movió el precio a favor de la posición, en % de la entrada."""
     if entry <= 0 or price <= 0:
@@ -45,6 +58,27 @@ def favorable_move_pct(price: float, entry: float, direction: str) -> float:
 def take_profit_price(entry: float, direction: str, tp_pct: float) -> float:
     factor = 1.0 + tp_pct / 100.0 if direction == LONG else 1.0 - tp_pct / 100.0
     return entry * factor
+
+
+def stop_loss_price(entry: float, direction: str, sl_pct: float) -> float:
+    factor = 1.0 - sl_pct / 100.0 if direction == LONG else 1.0 + sl_pct / 100.0
+    return entry * factor
+
+
+def exit_price(entry: float, direction: str, pct: float, inverted: bool = False) -> float:
+    """Precio de salida: TP en modo normal, SL en modo invertido."""
+    return stop_loss_price(entry, direction, pct) if inverted else take_profit_price(entry, direction, pct)
+
+
+def exit_hit(price: float, target: float, direction: str, inverted: bool = False) -> bool:
+    """¿El precio tocó la salida? TP (a favor) en normal, SL (en contra) en invertido."""
+    if price <= 0 or target <= 0:
+        return False
+    up = price >= target
+    down = price <= target
+    if inverted:
+        return down if direction == LONG else up
+    return up if direction == LONG else down
 
 
 def take_profit_hit(price: float, entry: float, direction: str, tp_pct: float) -> bool:
@@ -59,6 +93,18 @@ def pnl_usd(price: float, entry: float, qty: float, direction: str) -> float:
         return 0.0
     diff = price - entry
     return diff * qty if direction == LONG else -diff * qty
+
+
+def fees_usd(entry: float, price: float, qty: float, fee_pct: float) -> float:
+    """Comisión de entrada + salida (fee_pct % de cada notional)."""
+    return (entry * qty + max(price, 0.0) * qty) * fee_pct / 100.0
+
+
+def net_pnl_usd(price: float, entry: float, qty: float, direction: str, fee_pct: float) -> float:
+    """PnL descontando la comisión de entrada y la de salida."""
+    if price <= 0:
+        return 0.0
+    return pnl_usd(price, entry, qty, direction) - fees_usd(entry, price, qty, fee_pct)
 
 
 def _decimals(step: float) -> int:

@@ -56,3 +56,27 @@ def test_size_order_skips_coarse_step_on_expensive_pair():
 def test_size_order_decimal_step():
     qty, eff, why = st.size_order(5, 2.1234, step=0.1, min_notional=5)
     assert why == "" and qty == pytest.approx(2.4) and 5 <= eff < 5.2
+
+
+def test_inverted_direction_and_stop_loss():
+    from strategy import entry_direction, exit_price, exit_hit
+    assert entry_direction(1.0, 1.04, 3) == "LONG"
+    assert entry_direction(1.0, 1.04, 3, inverted=True) == "SHORT"
+    assert entry_direction(1.0, 0.96, 3, inverted=True) == "LONG"
+    assert entry_direction(1.0, 1.01, 3, inverted=True) is None
+    sl = exit_price(100.0, "SHORT", 2, inverted=True)       # SHORT invertido: SL arriba
+    assert abs(sl - 102.0) < 1e-9
+    assert not exit_hit(101.9, sl, "SHORT", inverted=True)
+    assert exit_hit(102.0, sl, "SHORT", inverted=True)
+    sl = exit_price(100.0, "LONG", 2, inverted=True)        # LONG invertido: SL abajo
+    assert abs(sl - 98.0) < 1e-9 and exit_hit(97.9, sl, "LONG", True) and not exit_hit(105, sl, "LONG", True)
+    tp = exit_price(100.0, "LONG", 2)                       # normal: TP
+    assert exit_hit(102.0, tp, "LONG") and not exit_hit(101.0, tp, "LONG")
+
+
+def test_net_pnl_counts_entry_and_exit_fees():
+    from strategy import net_pnl_usd, fees_usd
+    # 5 USDT a 1.0 → 5 de qty; sale a 1.02 → bruto 0.10; fees 0.05 % de 5 + 5.1
+    assert abs(fees_usd(1.0, 1.02, 5, 0.05) - 0.00505) < 1e-12
+    assert abs(net_pnl_usd(1.02, 1.0, 5, "LONG", 0.05) - (0.10 - 0.00505)) < 1e-12
+    assert abs(net_pnl_usd(1.02, 1.0, 5, "SHORT", 0.05) - (-0.10 - 0.00505)) < 1e-12

@@ -30,6 +30,12 @@ services:
         value: "3"
       - key: LIVE_TAKE_PROFIT_PCT
         value: "2"
+      - key: INVERT_SIGNALS
+        value: "false"        # true = contra la vela y el % es stop loss (también con el botón de la web)
+      - key: FEE_PCT
+        value: "0.05"         # comisión por lado que se resta al PnL
+      - key: PROFIT_TARGET_USD
+        value: "12"           # realizado + abierto con el que se cierra todo (0 = apagado)
       - key: NOTIONAL_USDT
         value: "5"            # USDT por entrada
       - key: COOLDOWN_SECONDS

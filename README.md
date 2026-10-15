@@ -27,6 +27,27 @@ En la web, las pestañas *Bot al cierre* / *Bot en vivo* eligen qué bot se ve y
 
 Las cifras se configuran con variables de entorno (tabla abajo). El **% de la señal** y el **% del TP** de cada bot también se cambian en caliente desde el bloque *Parámetros* de la web o con `POST /api/config` (`{"engine": "live", "threshold_pct": 3, "tp_pct": 2}`; sin `engine` se cambia el bot al cierre). El umbral aplica desde la siguiente señal; el TP nuevo también se aplica a las posiciones abiertas de ese bot. Los valores se guardan en `SETTINGS_FILE` (los ajustes de la versión anterior pasan al bot al cierre).
 
+### Modo invertido (botón, para los dos bots)
+
+En el bloque *Modo y objetivo* de la web hay un botón **Invertir** (o `POST /api/global` con `{"inverted": true}`):
+
+| | Modo normal | Modo invertido |
+| --- | --- | --- |
+| Vela verde ≥ umbral | LONG | **SHORT** |
+| Vela roja ≥ umbral | SHORT | **LONG** |
+| El % de *TP* de cada bot | take profit | **stop loss** |
+| Take profit | sí | **no** |
+
+El cambio aplica a las entradas nuevas de los dos bots. Cada posición guarda el modo con el que se abrió: las abiertas en modo normal siguen con su TP, y las invertidas con su SL, aunque se vuelva a cambiar. Al cerrar por SL el motivo es `SL`.
+
+### Objetivo global de ganancia
+
+Si **PnL realizado + PnL abierto** (de los dos bots, netos de fees, contados desde el último objetivo) llega a **+12 USD**, se cierran **todas** las posiciones de los dos bots (motivo `OBJETIVO`) y el contador vuelve a cero. El objetivo se cambia en la web o con `POST /api/global` (`{"profit_target_usd": 12}`; `0` lo apaga). El botón *Poner a cero* (o `POST /api/session/reset`) reinicia el contador a mano.
+
+### Fees
+
+Todo el PnL (abierto, realizado, el enviado al executor y el del objetivo) es **neto**: resta la comisión de entrada y la de salida, `FEE_PCT` % del notional en cada lado (0,05 %, taker de Binance). Se cambia en la web o con `POST /api/global` (`{"fee_pct": 0.05}`). El historial guarda `pnl` (neto), `pnl_gross` y `fees`.
+
 ### Bloquear longs o shorts
 
 En el bloque *Parámetros* de cada bot hay un botón por dirección (o `POST /api/block` con `{"engine": "close", "direction": "LONG", "blocked": true}`). Solo afecta a ese bot. Una dirección bloqueada no abre entradas nuevas; sus señales aparecen como *bloqueada* en la tabla de señales. Las posiciones ya abiertas siguen hasta su TP o cierre manual. El estado se guarda en `SETTINGS_FILE`.
@@ -84,6 +105,9 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `LIVE_TAKE_PROFIT_PCT` | = `TAKE_PROFIT_PCT` | Bot en vivo: avance a favor para cerrar. |
 | `NOTIONAL_USDT` | `5` | USDT por entrada. |
 | `MAX_NOTIONAL_OVER` | `1.5` | Si el redondeo al `stepSize` supera notional × esto, se salta el par. |
+| `INVERT_SIGNALS` | `false` | Arrancar en modo invertido (luego manda el botón de la web). |
+| `FEE_PCT` | `0.05` | Comisión por lado (% del notional) que se resta al PnL. |
+| `PROFIT_TARGET_USD` | `12` | Realizado + abierto con el que se cierra todo. `0` = apagado. |
 | `COOLDOWN_SECONDS` | `0` | Pausa tras un cierre antes de que ese bot vuelva a operar el símbolo. |
 | `SIGNAL_MAX_DELAY_S` | `10` | Un cierre de vela que llega más tarde que esto no genera señal. |
 | `PRICE_MAX_AGE_S` | `5` | Antigüedad máxima del precio usado para el TP. |
@@ -107,6 +131,8 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `GET /api/trades?engine=` | Historial de cierres de un bot, o de los dos. |
 | `GET /api/trades.csv?engine=` | Historial con MFE/MAE en CSV. |
 | `POST /api/block` | Bloquear o permitir LONG o SHORT en un bot. |
+| `GET/POST /api/global` | Modo invertido, objetivo en USD y fee (común a los dos bots). |
+| `POST /api/session/reset` | Poner a cero el contador del objetivo. |
 | `GET /health`, `GET /api/recovery` | Diagnóstico. |
 
 ## Ejecutar local
