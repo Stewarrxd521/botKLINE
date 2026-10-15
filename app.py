@@ -11,6 +11,13 @@ Estrategia (común)
     dirección (se identifican por trade_id).
   • Cierre cuando el precio avanza el TP (2 %) o más a favor desde la entrada.
     SIN stop loss (solo cierre manual desde la web).
+  • Modo invertido (un botón para los dos bots): la entrada va AL REVÉS de la
+    vela (verde → SHORT, roja → LONG) y el mismo % funciona como STOP LOSS; no
+    hay TP. Cada posición guarda el modo con el que se abrió.
+  • Objetivo global: si PnL realizado + PnL abierto (desde el último objetivo)
+    llega a +PROFIT_TARGET_USD (12 USD), se cierran TODAS las posiciones de los
+    dos bots y el contador vuelve a cero.
+  • El PnL es NETO: resta la comisión de entrada y la de salida (FEE_PCT).
 
 Los dos bots
   • Bot al cierre ("close"): mira la vela cuando CIERRA.
@@ -90,6 +97,12 @@ SIGNAL_MAX_DELAY_S   = float(os.getenv("SIGNAL_MAX_DELAY_S", "10"))
 COOLDOWN_SECONDS     = float(os.getenv("COOLDOWN_SECONDS", "0"))
 PRICE_MAX_AGE_S      = float(os.getenv("PRICE_MAX_AGE_S", "5"))         # precio más viejo no se usa
 SAFETY_TICK_SECS     = float(os.getenv("SAFETY_TICK_SECS", "1"))        # revisión periódica del TP
+# Modo invertido: entra contra la vela y el % del TP pasa a ser stop loss (sin TP).
+INVERT_SIGNALS       = os.getenv("INVERT_SIGNALS", "false").lower() in ("1", "true", "yes")
+# Comisión por lado en % del notional (taker de Binance USDⓈ-M: 0,05 %).
+FEE_PCT              = float(os.getenv("FEE_PCT", "0.05"))
+# Cierra todo cuando realizado + abierto (desde el último objetivo) llega a esto. 0 = apagado.
+PROFIT_TARGET_USD    = float(os.getenv("PROFIT_TARGET_USD", "12"))
 # Bot en vivo (vela en curso): por defecto los mismos % que el bot al cierre.
 LIVE_SIGNAL_THRESHOLD_PCT = float(os.getenv("LIVE_SIGNAL_THRESHOLD_PCT", str(SIGNAL_THRESHOLD_PCT)))
 LIVE_TAKE_PROFIT_PCT      = float(os.getenv("LIVE_TAKE_PROFIT_PCT", str(TAKE_PROFIT_PCT)))
@@ -318,6 +331,7 @@ class Position:
     low_price:   float = 0.0
     strategy:    str = "close"  # bot que la abrió: close | live
     candle_age_s: float = 0.0   # segundos de vela transcurridos al entrar (bot en vivo)
+    inverted:    bool = False   # abierta en modo invertido: tp_price es un STOP LOSS
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -424,6 +438,17 @@ class KlineBot:
                                  LIVE_SIGNAL_THRESHOLD_PCT, LIVE_TAKE_PROFIT_PCT),
         }
         self.live = self.engines[ENGINE_LIVE]
+        # Ajustes comunes a los dos bots (botón y campos de la web).
+        self.inverted = bool(settings.get("inverted", INVERT_SIGNALS))
+        self.fee_pct = float(settings["fee_pct"]) if settings.get("fee_pct") is not None else FEE_PCT
+        self.profit_target_usd = (float(settings["profit_target_usd"])
+                                  if settings.get("profit_target_usd") is not None else PROFIT_TARGET_USD)
+        # Objetivo global: PnL realizado acumulado en el último reinicio del contador.
+        self.session_base = 0.0
+        self.session_started_ts = time.time()
+        self.target_hits = 0
+        self.last_target = ""
+        self._target_closing = False
 
         # Evaluaciones: cada cierre de vela 1m se mide, pase o no el umbral.
         # minuto (open_time ms) → [(cuerpo %, símbolo, apertura, cierre), ...]
@@ -485,7 +510,9 @@ class KlineBot:
         t = self.executor.target
         data = {"executor_url": t.url, "executor_secret": t.secret,
                 "executor_changed_ts": self.executor_changed_ts,
-                "engines": {n: e.settings() for n, e in self.engines.items()}}
+                "engines": {n: e.settings() for n, e in self.engines.items()},
+                "inverted": self.inverted, "fee_pct": self.fee_pct,
+                "profit_target_usd": self.profit_target_usd}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -507,7 +534,7 @@ class KlineBot:
             eng.tp_pct = tp_pct
             with self.lock:
                 for p in eng.positions.values():
-                    p.tp_price = strategy.take_profit_price(p.entry_price, p.direction, tp_pct)
+                    p.tp_price = strategy.exit_price(p.entry_price, p.direction, tp_pct, p.inverted)
                 syms = {p.symbol for p in eng.positions.values()}
             for sym in syms:
                 self._on_price_event(sym, "config")      # revisa ya el TP nuevo
@@ -516,6 +543,76 @@ class KlineBot:
             self.store.mark_dirty(True)
             self.log(f"[config] {eng.label}: " + " | ".join(changes))
         return {"engine": eng.name, "threshold_pct": eng.threshold_pct, "tp_pct": eng.tp_pct}
+
+    def set_global(self, inverted: Optional[bool] = None, fee_pct: Optional[float] = None,
+                   profit_target_usd: Optional[float] = None) -> dict:
+        """Ajustes comunes a los dos bots. Invertir aplica a las entradas
+        nuevas; las abiertas siguen con el modo (TP o SL) con el que se abrieron."""
+        changes = []
+        if inverted is not None and inverted != self.inverted:
+            self.inverted = inverted
+            changes.append("modo INVERTIDO (contra la vela, % = stop loss, sin TP)" if inverted
+                           else "modo NORMAL (sigue la vela, % = take profit)")
+        if fee_pct is not None and fee_pct != self.fee_pct:
+            changes.append(f"fee {self.fee_pct:g}% → {fee_pct:g}% por lado")
+            self.fee_pct = fee_pct
+        if profit_target_usd is not None and profit_target_usd != self.profit_target_usd:
+            changes.append(f"objetivo {self.profit_target_usd:g} → {profit_target_usd:g} USD")
+            self.profit_target_usd = profit_target_usd
+        if changes:
+            self._save_settings()
+            self.store.mark_dirty(True)
+            self.log("[config] ambos bots: " + " | ".join(changes))
+        return self.global_settings()
+
+    def global_settings(self) -> dict:
+        return {"inverted": self.inverted, "fee_pct": self.fee_pct,
+                "profit_target_usd": self.profit_target_usd}
+
+    def realized_total(self) -> float:
+        with self.lock:
+            return sum(e.total_realized_pnl for e in self.engines.values())
+
+    def _net_pnl(self, p: Position, price: float) -> float:
+        return strategy.net_pnl_usd(price, p.entry_price, p.qty, p.direction, self.fee_pct)
+
+    def session_pnl(self) -> Tuple[float, float]:
+        """(realizado, abierto) desde el último objetivo o reinicio, netos de fees."""
+        with self.lock:
+            unreal = sum(self._net_pnl(p, self._price(p.symbol) or p.last_price)
+                         for e in self.engines.values() for p in e.positions.values())
+        return self.realized_total() - self.session_base, unreal
+
+    def reset_session(self, why: str = "manual") -> None:
+        self.session_base = self.realized_total()
+        self.session_started_ts = time.time()
+        self.store.mark_dirty(True)
+        self.log(f"[objetivo] contador de la sesión a cero ({why})")
+
+    def _check_profit_target(self) -> None:
+        """Cierra TODAS las posiciones de los dos bots cuando realizado + abierto
+        (desde el último objetivo) llega al objetivo en USD."""
+        target = self.profit_target_usd
+        if target <= 0 or self._target_closing or not self.store.can_act():
+            return
+        realized, unreal = self.session_pnl()
+        if realized + unreal < target:
+            return
+        self._target_closing = True
+        try:
+            with self.lock:
+                targets = [p for e in self.engines.values() for p in e.positions.values()]
+            self.log(f"[objetivo] 🎯 realizado {realized:+.4f} + abierto {unreal:+.4f} = "
+                     f"{realized + unreal:+.4f} USD ≥ {target:g}: cierro {len(targets)} posición(es)")
+            for pos in targets:
+                price = self._price(pos.symbol) or pos.last_price or pos.entry_price
+                self._close(pos.trade_id, price, "OBJETIVO")
+            self.target_hits += 1
+            final = self.realized_total() - self.session_base
+            self.last_target = f"{_utc(time.time(), '%m-%d %H:%M:%S')} · {final:+.4f} USD"
+            self.reset_session(f"objetivo alcanzado con {final:+.4f} USD")
+        finally:
+            self._target_closing = False
 
     def set_block(self, eng: Engine, direction: str, blocked: bool) -> dict:
         """Bloquea o desbloquea las entradas nuevas de una dirección en un bot.
@@ -561,7 +658,10 @@ class KlineBot:
     async def _main(self) -> None:
         for eng in self.engines.values():
             self.log(f"{eng.label} | {ENGINE_HINTS[eng.name]} | señal ≥ {eng.threshold_pct:g}% | "
-                     f"TP {eng.tp_pct:g}% | {NOTIONAL_USDT:g} USDT | sin stop loss")
+                     f"{'SL' if self.inverted else 'TP'} {eng.tp_pct:g}% | {NOTIONAL_USDT:g} USDT")
+        self.log(f"Modo {'INVERTIDO (contra la vela, sin TP)' if self.inverted else 'normal (sigue la vela, sin SL)'} | "
+                 f"fee {self.fee_pct:g}% por lado | objetivo global "
+                 f"{f'+{self.profit_target_usd:g} USD' if self.profit_target_usd > 0 else 'apagado'}")
         self.log(f"Executor → {self.executor.target.url or '(vacío)'}")
         self.log(f"[estado] Persistencia: {self._store_desc}")
         self.store.start()
@@ -697,9 +797,10 @@ class KlineBot:
         self._live_fired[symbol] = candle.open_time
         loop = self.loop
         if loop is not None:
-            direction = strategy.LONG if body >= thr else strategy.SHORT
+            inv = self.inverted
+            direction = strategy.LONG if (body >= thr) != inv else strategy.SHORT
             loop.call_soon_threadsafe(self._handle_signal, self.live, symbol, direction, candle,
-                                      time.time(), time.perf_counter())
+                                      time.time(), time.perf_counter(), inv)
 
     def _on_kline_close(self, symbol: str, interval: str, candle: Candle) -> None:
         """Cierre de vela → bot al cierre. El bot en vivo también lo mira por si
@@ -709,15 +810,16 @@ class KlineBot:
         if loop is None:
             return
         arrived, t0 = time.time(), time.perf_counter()
+        inv = self.inverted
         for eng in self.engines.values():
-            direction = strategy.signal_direction(candle.open, candle.close, eng.threshold_pct)
+            direction = strategy.entry_direction(candle.open, candle.close, eng.threshold_pct, inv)
             if direction is None:
                 continue
             if eng is self.live:
                 if self._live_fired.get(symbol) == candle.open_time:
                     continue
                 self._live_fired[symbol] = candle.open_time
-            loop.call_soon_threadsafe(self._handle_signal, eng, symbol, direction, candle, arrived, t0)
+            loop.call_soon_threadsafe(self._handle_signal, eng, symbol, direction, candle, arrived, t0, inv)
 
     def _record_eval(self, symbol: str, candle: Candle) -> None:
         body = strategy.body_change_pct(candle.open, candle.close)
@@ -773,8 +875,9 @@ class KlineBot:
             })
 
     def _handle_signal(self, eng: Engine, symbol: str, direction: str, candle: Candle,
-                       arrived: float, t0: float = 0.0) -> None:
-        """Corre en el loop del bot. Decide si `eng` abre y lanza la apertura."""
+                       arrived: float, t0: float = 0.0, inverted: bool = False) -> None:
+        """Corre en el loop del bot. Decide si `eng` abre y lanza la apertura.
+        `direction` ya viene invertida si `inverted` (modo con el que se decidió)."""
         if eng._last_candle.get(symbol, -1) >= candle.open_time:
             return                                          # duplicado tras reconexión
         eng._last_candle[symbol] = candle.open_time
@@ -814,10 +917,10 @@ class KlineBot:
         pos = Position(
             trade_id=self._next_trade_id(), symbol=symbol, direction=direction,
             entry_price=price, qty=qty, notional=eff,
-            tp_price=strategy.take_profit_price(price, direction, eng.tp_pct),
+            tp_price=strategy.exit_price(price, direction, eng.tp_pct, inverted),
             signal_pct=body, candle_open=candle.open, candle_close=candle.close,
             candle_time=candle.open_time, last_price=price,
-            strategy=eng.name, candle_age_s=round(age, 2),
+            strategy=eng.name, candle_age_s=round(age, 2), inverted=inverted,
         )
         with self.lock:
             eng.positions[pos.trade_id] = pos
@@ -828,9 +931,10 @@ class KlineBot:
         self.store.mark_dirty(True)
         decide_ms = (time.perf_counter() - t0) * 1000 if t0 else 0.0
         skip(f"abierta #{pos.trade_id} en {decide_ms:.1f} ms")
-        self.log(f"[{eng.label}] ABRE {direction} {symbol} | vela {candle.open:g}→{candle.close:g} "
+        kind = "SL" if inverted else "TP"
+        self.log(f"[{eng.label}] ABRE {direction} {symbol}{' (invertido)' if inverted else ''} | vela {candle.open:g}→{candle.close:g} "
                  f"({body:+.2f}% a los {age:.0f}s) | px={price:g} qty={qty:g} ({eff:.2f} USDT) | "
-                 f"TP {pos.tp_price:g} | trade #{pos.trade_id}")
+                 f"{kind} {pos.tp_price:g} | trade #{pos.trade_id}")
         self.executor.send({
             "action":    "open",
             "trade_id":  pos.trade_id,
@@ -871,6 +975,7 @@ class KlineBot:
                 self._wake_scheduled = False
             for sym in batch:
                 self._check_take_profit(sym)
+            self._check_profit_target()
             await asyncio.sleep(0)
 
     def _price(self, symbol: str) -> Optional[float]:
@@ -880,7 +985,8 @@ class KlineBot:
         return pc.get_price(symbol, max_age_s=PRICE_MAX_AGE_S)
 
     def _check_take_profit(self, symbol: str) -> None:
-        """Revisa el TP de TODAS las posiciones abiertas del símbolo, de los dos bots."""
+        """Revisa la salida (TP, o SL si se abrió invertida) de TODAS las posiciones
+        abiertas del símbolo, de los dos bots."""
         price = self._price(symbol)
         if not price:
             return
@@ -891,11 +997,11 @@ class KlineBot:
                     if pos.symbol != symbol:
                         continue
                     pos.update(price)
-                    if (price >= pos.tp_price) if pos.direction == strategy.LONG else (price <= pos.tp_price):
-                        hits.append(tid)
+                    if strategy.exit_hit(price, pos.tp_price, pos.direction, pos.inverted):
+                        hits.append((tid, "SL" if pos.inverted else "TP"))
         if hits and self.store.can_act():
-            for tid in hits:
-                self._close(tid, price, "TP")
+            for tid, reason in hits:
+                self._close(tid, price, reason)
 
     def _close(self, trade_id: int, price: float, reason: str) -> bool:
         with self.lock:
@@ -910,7 +1016,9 @@ class KlineBot:
                 if pos is None:
                     return False
                 pos.update(price)
-                pnl = strategy.pnl_usd(price, pos.entry_price, pos.qty, pos.direction)
+                gross = strategy.pnl_usd(price, pos.entry_price, pos.qty, pos.direction)
+                fees = strategy.fees_usd(pos.entry_price, price, pos.qty, self.fee_pct)
+                pnl = gross - fees                          # neto: fees de entrada y salida
                 now = time.time()
                 rec = {
                     **asdict(pos),
@@ -919,6 +1027,9 @@ class KlineBot:
                     "duration_s": now - pos.opened_ts,
                     "move_pct": strategy.favorable_move_pct(price, pos.entry_price, pos.direction),
                     "pnl": pnl,
+                    "pnl_gross": gross,
+                    "fees": fees,
+                    "fee_pct": self.fee_pct,
                     "pnl_pct": pnl / pos.notional * 100.0 if pos.notional else 0.0,
                     "reason": reason,
                     "time_to_mfe_s": (pos.mfe_ts - pos.opened_ts) if pos.mfe_ts else 0.0,
@@ -934,7 +1045,7 @@ class KlineBot:
             self._refresh_pos_syms()
             self.store.mark_dirty(True)
             self.log(f"[{eng.label}] CIERRA {pos.direction} {symbol} ({reason}) | entrada {pos.entry_price:g} → "
-                     f"{price:g} ({rec['move_pct']:+.2f}%) | PnL {pnl:+.4f} USDT | trade #{pos.trade_id}")
+                     f"{price:g} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}) | trade #{pos.trade_id}")
             self.executor.send({
                 "action":      "close",
                 "trade_id":    pos.trade_id,
@@ -979,8 +1090,9 @@ class KlineBot:
         while self.running:
             await asyncio.sleep(max(0.2, SAFETY_TICK_SECS))
             now = time.time()
-            for sym in list(self._pos_syms):              # red de seguridad del TP
+            for sym in list(self._pos_syms):              # red de seguridad del TP/SL
                 self._check_take_profit(sym)
+            self._check_profit_target()
             with self.lock:
                 for eng in self.engines.values():
                     if eng.cooldown:
@@ -1001,6 +1113,9 @@ class KlineBot:
                 "trade_id_seq": self.trade_id_seq,
                 "positions": {str(t): asdict(p) for e in self.engines.values()
                               for t, p in e.positions.items()},
+                "session_base": self.session_base,
+                "session_started_ts": self.session_started_ts,
+                "target_hits": self.target_hits,
                 "engines": {n: {"total_realized_pnl": e.total_realized_pnl,
                                 "cooldowns": {s: t for s, t in e.cooldown.items() if t > now}}
                             for n, e in self.engines.items()},
@@ -1051,6 +1166,9 @@ class KlineBot:
                 eng.total_realized_pnl = float(saved.get("total_realized_pnl") or 0.0)
                 eng.closed_trades = [t for t in rows if route(t) == name][:500]
             all_pos = [p for ps in positions.values() for p in ps.values()]
+            self.session_base = float(doc.get("session_base") or 0.0)
+            self.session_started_ts = float(doc.get("session_started_ts") or self.session_started_ts)
+            self.target_hits = int(doc.get("target_hits") or 0)
             self.trade_id_seq = max(int(doc.get("trade_id_seq") or 0), *[p.trade_id for p in all_pos], 0)
         self._refresh_pos_syms()
         if not self.store.enable_writes():
@@ -1103,7 +1221,7 @@ class KlineBot:
                     **asdict(p),
                     "price":    price,
                     "move_pct": strategy.favorable_move_pct(price, p.entry_price, p.direction),
-                    "pnl":      strategy.pnl_usd(price, p.entry_price, p.qty, p.direction),
+                    "pnl":      self._net_pnl(p, price),
                     "age_s":    now - p.opened_ts,
                     "opened":   _utc(p.opened_ts, "%m-%d %H:%M:%S"),
                 })
@@ -1133,6 +1251,16 @@ class KlineBot:
             "signals":        signals,
             "excursions":     self.excursion_stats(eng),
             "evaluations":    self.evaluations(eng.threshold_pct),
+        }
+
+    def _global_snapshot(self) -> dict:
+        realized, unreal = self.session_pnl()
+        return {
+            **self.global_settings(),
+            "session_realized": realized, "session_unrealized": unreal,
+            "session_pnl": realized + unreal,
+            "session_since": _utc(self.session_started_ts, "%m-%d %H:%M:%S"),
+            "target_hits": self.target_hits, "last_target": self.last_target,
         }
 
     def snapshot(self) -> dict:
@@ -1166,6 +1294,7 @@ class KlineBot:
             },
             "prices_connected": bool(pc and pc.is_connected()),
             "eval_total":      self.eval_count,
+            "global":          self._global_snapshot(),
             "engines":         {n: self._engine_snapshot(e, now) for n, e in self.engines.items()},
             "events":          events,
             "last_error":      self.last_error,
@@ -1286,6 +1415,48 @@ def api_config_set():
     return jsonify({"ok": True, **bot.set_config(eng, **vals)})
 
 
+@app.get("/api/global")
+def api_global_get():
+    return _no_store(jsonify({"ok": True, **bot._global_snapshot()}))
+
+
+@app.post("/api/global")
+def api_global_set():
+    """Ajustes comunes a los dos bots. Body JSON (todo opcional):
+    {"inverted": true, "profit_target_usd": 12, "fee_pct": 0.05}.
+    profit_target_usd 0 = sin objetivo global."""
+    busy = _guard()
+    if busy:
+        return busy
+    data = request.get_json(silent=True) or {}
+    vals = {}
+    if "inverted" in data:
+        vals["inverted"] = bool(data["inverted"])
+    for key, hi in (("profit_target_usd", 1_000_000), ("fee_pct", 1)):
+        if data.get(key) in (None, ""):
+            continue
+        try:
+            v = float(data[key])
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": f"{key} inválido"}), 400
+        if not 0 <= v <= hi:
+            return jsonify({"ok": False, "error": f"{key} debe estar entre 0 y {hi:g}"}), 400
+        vals[key] = v
+    if not vals:
+        return jsonify({"ok": False, "error": "Nada que cambiar"}), 400
+    return jsonify({"ok": True, **bot.set_global(**vals)})
+
+
+@app.post("/api/session/reset")
+def api_session_reset():
+    """Pone a cero el contador del objetivo global (realizado + abierto)."""
+    busy = _guard()
+    if busy:
+        return busy
+    bot.reset_session("desde la web")
+    return jsonify({"ok": True, **bot._global_snapshot()})
+
+
 @app.post("/api/block")
 def api_block():
     """Bloquea/desbloquea entradas por dirección en un bot. Body JSON:
@@ -1347,8 +1518,8 @@ def api_trades():
 
 TRADE_CSV_COLS = [
     "strategy", "trade_id", "symbol", "direction", "reason", "opened_ts", "closed_at_ts", "duration_s",
-    "signal_pct", "candle_age_s", "entry_price", "close_price", "qty", "notional", "tp_price", "move_pct",
-    "pnl", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
+    "inverted", "signal_pct", "candle_age_s", "entry_price", "close_price", "qty", "notional", "tp_price",
+    "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
     "time_to_mae_s", "high_price", "low_price",
 ]
 
@@ -1447,8 +1618,27 @@ HTML = r"""<!doctype html>
     <div class="card stat"><div class="label">Estado</div><div class="v" id="sState">—</div></div>
   </div>
 
+  <div class="card">
+    <h2>Modo y objetivo <span class="muted" style="font-size:12px;font-weight:400">(común a los dos bots)</span></h2>
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+      <button type="button" id="btnInvert" style="font-size:15px;padding:10px 18px">—</button>
+      <span class="muted" id="modeHint"></span>
+    </div>
+    <div style="margin-top:12px">PnL de la sesión (realizado + abierto, con fees):
+      <b id="sessPnl" style="font-size:18px">—</b> <span class="muted">de</span> <b id="sessTarget">—</b>
+      <span class="muted" id="sessDetail"></span>
+      <button type="button" class="small" id="btnReset">Poner a cero</button></div>
+    <div class="muted" id="sessHits" style="margin-top:4px"></div>
+    <form id="glbForm" style="margin-top:10px">
+      <input id="glbTarget" type="number" step="0.01" min="0" placeholder="Objetivo en USD para cerrar todo (ej. 12; 0 = apagado)">
+      <input id="glbFee" type="number" step="0.001" min="0" max="1" placeholder="Fee % por lado (ej. 0.05)">
+      <button type="submit">Guardar</button>
+    </form>
+    <div id="glbMsg" class="muted" style="margin-top:8px;min-height:18px"></div>
+  </div>
+
   <div class="card"><h2>Los dos bots</h2><div class="scroll"><table>
-    <thead><tr><th>Bot</th><th>Entra</th><th>Señal</th><th>TP</th><th>Bloqueados</th><th>Señales / abiertas</th><th>Abiertas</th><th>Cerradas (gan.)</th><th>PnL abierto</th><th>PnL realizado</th></tr></thead>
+    <thead><tr><th>Bot</th><th>Entra</th><th>Señal</th><th>Salida</th><th>Bloqueados</th><th>Señales / abiertas</th><th>Abiertas</th><th>Cerradas (gan.)</th><th>PnL abierto</th><th>PnL realizado</th></tr></thead>
     <tbody id="tEng"></tbody></table></div></div>
 
   <div class="card">
@@ -1476,10 +1666,10 @@ HTML = r"""<!doctype html>
 
   <div class="card">
     <h2>Parámetros · <span class="engName"></span> (en caliente)</h2>
-    <div class="muted">Señal actual: <b id="cfgThr">—</b> · TP actual: <b id="cfgTp">—</b> · <span id="engLat"></span></div>
+    <div class="muted">Señal actual: <b id="cfgThr">—</b> · <span id="cfgTpLbl">TP</span> actual: <b id="cfgTp">—</b> · <span id="engLat"></span></div>
     <form id="cfgForm" style="margin-top:10px">
       <input id="cfgNewThr" type="number" step="0.01" min="0.01" max="100" placeholder="% cuerpo de vela para entrar (ej. 3)">
-      <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (ej. 2)">
+      <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (normal) / stop loss (invertido), ej. 2">
       <button type="submit">Guardar</button>
     </form>
     <div id="cfgMsg" class="muted" style="margin-top:8px;min-height:18px"></div>
@@ -1491,7 +1681,7 @@ HTML = r"""<!doctype html>
   </div>
 
   <div class="card"><h2>Posiciones abiertas · <span class="engName"></span></h2><div class="scroll"><table>
-    <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>TP</th><th>Notional</th><th>PnL</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
+    <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>Salida</th><th>Notional</th><th>PnL neto</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
     <tbody id="tPos"></tbody></table></div></div>
 
   <div class="card"><h2>MFE / MAE de las cerradas · <span class="engName"></span> <a id="csvLink" class="muted" style="font-size:12px;font-weight:400" href="/api/trades.csv">descargar CSV</a></h2><div class="scroll"><table>
@@ -1503,7 +1693,7 @@ HTML = r"""<!doctype html>
     <tbody id="tSig"></tbody></table></div></div>
 
   <div class="card"><h2>Operaciones cerradas · <span class="engName"></span></h2><div class="scroll"><table>
-    <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
+    <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL neto</th><th>Fees</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
     <tbody id="tClosed"></tbody></table></div></div>
 
   <div class="card"><h2>Evaluaciones · mayores cuerpos de la vela cerrada <span id="evMin"></span></h2><div class="scroll"><table>
@@ -1546,7 +1736,22 @@ function render(d) {
   const c = d.config, names = Object.keys(d.engines);
   if (!d.engines[cur]) cur = names[0];
   const e = d.engines[cur], ec = e.config;
-  q('rules').textContent = `Cuerpo de la vela 1m ≥ umbral → sigue la tendencia · ${c.notional} USDT por entrada · sin stop loss · cada bot con sus operaciones e historial`;
+  const g = d.global;
+  q('rules').textContent = g.inverted
+    ? `MODO INVERTIDO: cuerpo de la vela 1m ≥ umbral → entra CONTRA la vela · el % es stop loss, sin TP · ${c.notional} USDT por entrada · PnL con fee ${g.fee_pct}% por lado`
+    : `Cuerpo de la vela 1m ≥ umbral → sigue la tendencia · el % es take profit, sin stop loss · ${c.notional} USDT por entrada · PnL con fee ${g.fee_pct}% por lado`;
+  const bi = q('btnInvert');
+  bi.dataset.inverted = g.inverted ? '1' : '';
+  bi.textContent = g.inverted ? 'Modo INVERTIDO · volver a normal' : 'Modo normal · invertir';
+  bi.style.background = g.inverted ? 'var(--amber)' : 'var(--green)';
+  q('modeHint').textContent = g.inverted
+    ? 'Vela verde → SHORT, roja → LONG. El % de cada bot es stop loss; no hay TP.'
+    : 'Vela verde → LONG, roja → SHORT. El % de cada bot es take profit; no hay stop loss.';
+  q('sessPnl').innerHTML = usd(g.session_pnl);
+  q('sessTarget').textContent = g.profit_target_usd > 0 ? `+${g.profit_target_usd} USD` : 'objetivo apagado';
+  q('sessDetail').innerHTML = `(realizado ${usd(g.session_realized)} + abierto ${usd(g.session_unrealized)}, desde ${esc(g.session_since)})`;
+  q('sessHits').textContent = g.target_hits ? `Objetivo alcanzado ${g.target_hits} vez/veces · último: ${g.last_target || '—'}` : 'Al llegar al objetivo se cierran todas las posiciones de los dos bots y el contador vuelve a cero.';
+  const xk = g.inverted ? 'SL' : 'TP';
   q('exToken').style.display = c.admin_token ? '' : 'none';
   const k = d.klines;
   q('sKl').innerHTML = `${k.with_data}/${k.symbols} <span class="muted" style="font-size:12px">${k.active}/${k.connections} conex.</span>`;
@@ -1558,7 +1763,7 @@ function render(d) {
   q('tEng').innerHTML = names.map(n => { const x = d.engines[n], xc = x.config;
     const bl = [xc.block_long && 'LONG', xc.block_short && 'SHORT'].filter(Boolean).join(', ');
     return `<tr data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}"><td><b>${esc(x.label)}</b></td><td class="muted">${n === 'live' ? 'vela abierta' : 'al cierre'}</td>
-      <td>±${xc.threshold_pct}%</td><td>${xc.tp_pct}%</td><td class="${bl ? 'neg' : 'muted'}">${bl || 'ninguno'}</td>
+      <td>±${xc.threshold_pct}%</td><td>${xk} ${xc.tp_pct}%</td><td class="${bl ? 'neg' : 'muted'}">${bl || 'ninguno'}</td>
       <td>${x.signal_count} / ${x.opened_count}</td><td>${x.positions.length}</td><td>${x.closed_count} (${x.wins})</td>
       <td>${usd(x.unrealized_pnl)}</td><td>${usd(x.realized_pnl)}</td></tr>`; }).join('');
   q('tabs').innerHTML = names.map(n => { const x = d.engines[n];
@@ -1578,6 +1783,7 @@ function render(d) {
 
   q('cfgThr').textContent = `±${ec.threshold_pct}%`;
   q('cfgTp').textContent = `${ec.tp_pct}%`;
+  q('cfgTpLbl').textContent = xk;
   q('sSig').textContent = `${e.signal_count} / ${e.opened_count}`;
   q('sPos').textContent = e.positions.length;
   q('sUpnl').innerHTML = usd(e.unrealized_pnl);
@@ -1595,7 +1801,7 @@ function render(d) {
   q('tPos').innerHTML = e.positions.map(r => `<tr>
     <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span></td><td>${tag(r.direction)}</td>
     <td>${pct(r.signal_pct)}${cur === 'live' ? ` <span class="muted">${Math.round(r.candle_age_s || 0)}s</span>` : ''}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
-    <td>${pct(r.move_pct)}</td><td>${num(r.tp_price, 8)}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
+    <td>${pct(r.move_pct)}</td><td><span class="muted">${r.inverted ? 'SL' : 'TP'}</span> ${num(r.tp_price, 8)}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
     <td>${pct(r.mfe_pct)} <span class="muted">${usd(r.mfe_usd)}</span></td><td>${pct(r.mae_pct)} <span class="muted">${usd(r.mae_usd)}</span></td>
     <td>${esc(r.opened)} <span class="muted">(${dur(r.age_s)})</span></td>
     <td><button class="small" data-close="${r.trade_id}" data-label="${esc(r.direction)} ${esc(r.symbol)} #${r.trade_id}">Cerrar</button></td></tr>`).join('')
@@ -1609,9 +1815,9 @@ function render(d) {
 
   q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
     <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
-    <td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
+    <td class="muted">${num(t.fees || 0, 4)}</td><td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
     <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}</td></tr>`).join('')
-    || '<tr><td colspan="11" class="muted">Aún no hay cierres</td></tr>';
+    || '<tr><td colspan="12" class="muted">Aún no hay cierres</td></tr>';
 
   const exc = e.excursions;
   q('tExc').innerHTML = ['all', 'LONG', 'SHORT'].map(kk => {
@@ -1658,11 +1864,41 @@ q('cfgForm').addEventListener('submit', async ev => {
   try {
     const r = await (await fetch('/api/config', {method: 'POST', headers: headers(), body: JSON.stringify(body)})).json();
     q('cfgMsg').innerHTML = r.ok
-      ? `<span class="pos">Guardado en ${esc(last && last.engines[r.engine] ? last.engines[r.engine].label : r.engine)}.</span> Señal ±${r.threshold_pct}% · TP ${r.tp_pct}%`
+      ? `<span class="pos">Guardado en ${esc(last && last.engines[r.engine] ? last.engines[r.engine].label : r.engine)}.</span> Señal ±${r.threshold_pct}% · ${last && last.global.inverted ? 'SL' : 'TP'} ${r.tp_pct}%`
       : `<span class="neg">${esc(r.error)}</span>`;
     if (r.ok) { q('cfgNewThr').value = ''; q('cfgNewTp').value = ''; }
   } catch (e) { q('cfgMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
   refresh();
+});
+
+q('glbForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  await postGlobal({profit_target_usd: q('glbTarget').value, fee_pct: q('glbFee').value});
+  q('glbTarget').value = ''; q('glbFee').value = '';
+});
+
+async function postGlobal(body, url = '/api/global') {
+  saveToken();
+  q('glbMsg').textContent = 'Guardando…';
+  try {
+    const r = await (await fetch(url, {method: 'POST', headers: headers(), body: JSON.stringify(body)})).json();
+    q('glbMsg').innerHTML = r.ok
+      ? `<span class="pos">Guardado.</span> ${r.inverted ? 'Modo invertido' : 'Modo normal'} · objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · fee ${r.fee_pct}% por lado`
+      : `<span class="neg">${esc(r.error)}</span>`;
+  } catch (e) { q('glbMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
+  refresh();
+}
+
+q('btnInvert').addEventListener('click', () => {
+  const inv = !q('btnInvert').dataset.inverted;
+  const msg = inv
+    ? '¿Invertir los dos bots? Las entradas nuevas irán CONTRA la vela y el % será stop loss, sin TP. Las posiciones abiertas siguen con su TP.'
+    : '¿Volver al modo normal? Las entradas nuevas seguirán la vela con TP. Las posiciones abiertas invertidas siguen con su SL.';
+  if (confirm(msg)) postGlobal({inverted: inv});
+});
+
+q('btnReset').addEventListener('click', () => {
+  if (confirm('¿Poner a cero el PnL de la sesión? El objetivo se contará desde ahora.')) postGlobal({}, '/api/session/reset');
 });
 
 document.addEventListener('click', async ev => {
