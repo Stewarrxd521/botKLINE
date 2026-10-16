@@ -48,6 +48,14 @@ Si **PnL realizado + PnL abierto** (de los dos bots, netos de fees, contados des
 
 Todo el PnL (abierto, realizado, el enviado al executor y el del objetivo) es **neto**: resta la comisión de entrada y la de salida, `FEE_PCT` % del notional en cada lado (0,05 %, taker de Binance). Se cambia en la web o con `POST /api/global` (`{"fee_pct": 0.05}`). El historial guarda `pnl` (neto), `pnl_gross` y `fees`.
 
+### Pausar un bot, cerrar todo y límite de abiertas
+
+- **Pausar**: cada bot tiene su botón *Pausar / Reanudar* en el bloque *Control* (o `POST /api/pause` con `{"engine": "live", "paused": true}`). Un bot pausado no abre entradas nuevas (sus señales salen como *pausado*); sus posiciones abiertas siguen hasta su TP/SL.
+- **Cerrar todo**: *Cerrar TODAS las posiciones* cierra a mercado las de los dos bots, y *Cerrar todas las de este bot* las del bot elegido (`POST /api/close-all`, con `{"engine": "close"}` para un solo bot).
+- **Límite de abiertas**: máximo de posiciones abiertas a la vez sumando los dos bots, editable en caliente (`POST /api/global` con `{"max_open": 10}`; `0` = sin límite). Al llegar al límite las señales salen como *ignorada: límite de N abiertas*.
+
+La web agrupa todo en secciones plegables; recuerda cuáles dejaste abiertas y qué bot estabas viendo.
+
 ### Bloquear longs o shorts
 
 En el bloque *Parámetros* de cada bot hay un botón por dirección (o `POST /api/block` con `{"engine": "close", "direction": "LONG", "blocked": true}`). Solo afecta a ese bot. Una dirección bloqueada no abre entradas nuevas; sus señales aparecen como *bloqueada* en la tabla de señales. Las posiciones ya abiertas siguen hasta su TP o cierre manual. El estado se guarda en `SETTINGS_FILE`.
@@ -108,6 +116,7 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `INVERT_SIGNALS` | `false` | Arrancar en modo invertido (luego manda el botón de la web). |
 | `FEE_PCT` | `0.05` | Comisión por lado (% del notional) que se resta al PnL. |
 | `PROFIT_TARGET_USD` | `12` | Realizado + abierto con el que se cierra todo. `0` = apagado. |
+| `MAX_OPEN_POSITIONS` | `0` | Límite inicial de posiciones abiertas (los dos bots). `0` = sin límite. |
 | `COOLDOWN_SECONDS` | `0` | Pausa tras un cierre antes de que ese bot vuelva a operar el símbolo. |
 | `SIGNAL_MAX_DELAY_S` | `10` | Un cierre de vela que llega más tarde que esto no genera señal. |
 | `PRICE_MAX_AGE_S` | `5` | Antigüedad máxima del precio usado para el TP. |
@@ -132,6 +141,8 @@ El cambio aplica a la siguiente señal, sin reiniciar, y se guarda en disco loca
 | `GET /api/trades.csv?engine=` | Historial con MFE/MAE en CSV. |
 | `POST /api/block` | Bloquear o permitir LONG o SHORT en un bot. |
 | `GET/POST /api/global` | Modo invertido, objetivo en USD y fee (común a los dos bots). |
+| `POST /api/pause` | Pausar o reanudar un bot. |
+| `POST /api/close-all` | Cerrar todas las posiciones (de un bot con `engine`). |
 | `POST /api/session/reset` | Poner a cero el contador del objetivo. |
 | `GET /health`, `GET /api/recovery` | Diagnóstico. |
 

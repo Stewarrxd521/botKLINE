@@ -36,6 +36,8 @@ services:
         value: "0.05"         # comisión por lado que se resta al PnL
       - key: PROFIT_TARGET_USD
         value: "12"           # realizado + abierto con el que se cierra todo (0 = apagado)
+      - key: MAX_OPEN_POSITIONS
+        value: "0"            # límite inicial de posiciones abiertas, los dos bots (0 = sin límite)
       - key: NOTIONAL_USDT
         value: "5"            # USDT por entrada
       - key: COOLDOWN_SECONDS
