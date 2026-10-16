@@ -103,6 +103,8 @@ INVERT_SIGNALS       = os.getenv("INVERT_SIGNALS", "false").lower() in ("1", "tr
 FEE_PCT              = float(os.getenv("FEE_PCT", "0.05"))
 # Cierra todo cuando realizado + abierto (desde el último objetivo) llega a esto. 0 = apagado.
 PROFIT_TARGET_USD    = float(os.getenv("PROFIT_TARGET_USD", "12"))
+# Máximo de posiciones abiertas a la vez, sumando los dos bots. 0 = sin límite.
+MAX_OPEN_POSITIONS   = int(os.getenv("MAX_OPEN_POSITIONS", "0"))
 # Bot en vivo (vela en curso): por defecto los mismos % que el bot al cierre.
 LIVE_SIGNAL_THRESHOLD_PCT = float(os.getenv("LIVE_SIGNAL_THRESHOLD_PCT", str(SIGNAL_THRESHOLD_PCT)))
 LIVE_TAKE_PROFIT_PCT      = float(os.getenv("LIVE_TAKE_PROFIT_PCT", str(TAKE_PROFIT_PCT)))
@@ -332,6 +334,7 @@ class Position:
     strategy:    str = "close"  # bot que la abrió: close | live
     candle_age_s: float = 0.0   # segundos de vela transcurridos al entrar (bot en vivo)
     inverted:    bool = False   # abierta en modo invertido: tp_price es un STOP LOSS
+    sent:        bool = True    # se mandó al executor (False = simulada, envíos pausados)
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -372,6 +375,8 @@ class Engine:
         self.tp_pct = float(cfg.get("tp_pct") or tp_default)
         self.blocked = {strategy.LONG: bool(cfg.get("block_long")),
                         strategy.SHORT: bool(cfg.get("block_short"))}
+        # Pausado: no abre entradas nuevas; sus posiciones abiertas siguen su curso.
+        self.paused = bool(cfg.get("paused"))
         # trade_id → posición. Puede haber varias por símbolo y en ambas direcciones.
         self.positions: Dict[int, Position] = {}
         self.closed_trades: List[dict] = []
@@ -385,7 +390,8 @@ class Engine:
 
     def settings(self) -> dict:
         return {"threshold_pct": self.threshold_pct, "tp_pct": self.tp_pct,
-                "block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT]}
+                "block_long": self.blocked[strategy.LONG], "block_short": self.blocked[strategy.SHORT],
+                "paused": self.paused}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -444,6 +450,11 @@ class KlineBot:
         self.profit_target_usd = (float(settings["profit_target_usd"])
                                   if settings.get("profit_target_usd") is not None else PROFIT_TARGET_USD)
         # Objetivo global: PnL realizado acumulado en el último reinicio del contador.
+        # Modo prueba: los bots siguen operando en simulación pero NO mandan
+        # entradas nuevas al executor (los cierres de lo ya enviado sí salen).
+        self.executor_paused = bool(settings.get("executor_paused"))
+        self.max_open = (int(settings["max_open"]) if settings.get("max_open") is not None
+                         else MAX_OPEN_POSITIONS)
         self.session_base = 0.0
         self.session_started_ts = time.time()
         self.target_hits = 0
@@ -512,7 +523,8 @@ class KlineBot:
                 "executor_changed_ts": self.executor_changed_ts,
                 "engines": {n: e.settings() for n, e in self.engines.items()},
                 "inverted": self.inverted, "fee_pct": self.fee_pct,
-                "profit_target_usd": self.profit_target_usd}
+                "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
+                "executor_paused": self.executor_paused}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -545,7 +557,8 @@ class KlineBot:
         return {"engine": eng.name, "threshold_pct": eng.threshold_pct, "tp_pct": eng.tp_pct}
 
     def set_global(self, inverted: Optional[bool] = None, fee_pct: Optional[float] = None,
-                   profit_target_usd: Optional[float] = None) -> dict:
+                   profit_target_usd: Optional[float] = None, max_open: Optional[int] = None,
+                   executor_paused: Optional[bool] = None) -> dict:
         """Ajustes comunes a los dos bots. Invertir aplica a las entradas
         nuevas; las abiertas siguen con el modo (TP o SL) con el que se abrieron."""
         changes = []
@@ -559,6 +572,13 @@ class KlineBot:
         if profit_target_usd is not None and profit_target_usd != self.profit_target_usd:
             changes.append(f"objetivo {self.profit_target_usd:g} → {profit_target_usd:g} USD")
             self.profit_target_usd = profit_target_usd
+        if max_open is not None and max_open != self.max_open:
+            changes.append(f"límite de abiertas {self.max_open or 'sin límite'} → {max_open or 'sin límite'}")
+            self.max_open = max_open
+        if executor_paused is not None and executor_paused != self.executor_paused:
+            self.executor_paused = executor_paused
+            changes.append("envíos al executor PAUSADOS (entradas nuevas solo simuladas)" if executor_paused
+                           else "envíos al executor reanudados")
         if changes:
             self._save_settings()
             self.store.mark_dirty(True)
@@ -567,7 +587,12 @@ class KlineBot:
 
     def global_settings(self) -> dict:
         return {"inverted": self.inverted, "fee_pct": self.fee_pct,
-                "profit_target_usd": self.profit_target_usd}
+                "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
+                "executor_paused": self.executor_paused}
+
+    def open_count(self) -> int:
+        with self.lock:
+            return sum(len(e.positions) for e in self.engines.values())
 
     def realized_total(self) -> float:
         with self.lock:
@@ -613,6 +638,30 @@ class KlineBot:
             self.reset_session(f"objetivo alcanzado con {final:+.4f} USD")
         finally:
             self._target_closing = False
+
+    def set_paused(self, eng: Engine, paused: bool) -> dict:
+        """Pausa o reanuda un bot: pausado no abre entradas nuevas; sus
+        posiciones abiertas siguen hasta su TP/SL o cierre manual."""
+        if eng.paused != paused:
+            eng.paused = paused
+            self._save_settings()
+            self.log(f"[config] {eng.label}: {'PAUSADO' if paused else 'en marcha'}")
+        return {"engine": eng.name, "paused": eng.paused}
+
+    def close_all(self, eng: Optional[Engine] = None, reason: str = "MANUAL") -> Tuple[int, int]:
+        """Cierra todas las posiciones (de un bot o de los dos). (cerradas, total)."""
+        engines = [eng] if eng is not None else list(self.engines.values())
+        with self.lock:
+            targets = [p for e in engines for p in e.positions.values()]
+        closed = 0
+        for pos in targets:
+            sym = pos.symbol
+            price = self._price(sym) or (self.price_cache.get_mark_price(sym) if self.price_cache else None) \
+                or pos.last_price or pos.entry_price
+            closed += self._close(pos.trade_id, price, reason)
+        if targets:
+            self.log(f"[cierre] {'todas' if eng is None else eng.label}: {closed}/{len(targets)} cerradas ({reason})")
+        return closed, len(targets)
 
     def set_block(self, eng: Engine, direction: str, blocked: bool) -> dict:
         """Bloquea o desbloquea las entradas nuevas de una dirección en un bot.
@@ -892,8 +941,12 @@ class KlineBot:
         delay = arrived - candle.close_time / 1000          # negativo con la vela abierta
         if delay > SIGNAL_MAX_DELAY_S:
             return skip(f"ignorada: llegó {delay:.0f}s tarde")
+        if eng.paused:
+            return skip("pausado")
         if eng.blocked.get(direction):
             return skip(f"bloqueada: {direction} desactivados")
+        if self.max_open > 0 and self.open_count() >= self.max_open:
+            return skip(f"ignorada: límite de {self.max_open} abiertas")
         if not self.store.can_open():
             return skip("ignorada: estado sin confirmar")
         # Sin límite por símbolo: cada señal abre su propia posición aunque ya
@@ -921,6 +974,7 @@ class KlineBot:
             signal_pct=body, candle_open=candle.open, candle_close=candle.close,
             candle_time=candle.open_time, last_price=price,
             strategy=eng.name, candle_age_s=round(age, 2), inverted=inverted,
+            sent=not self.executor_paused,
         )
         with self.lock:
             eng.positions[pos.trade_id] = pos
@@ -932,20 +986,22 @@ class KlineBot:
         decide_ms = (time.perf_counter() - t0) * 1000 if t0 else 0.0
         skip(f"abierta #{pos.trade_id} en {decide_ms:.1f} ms")
         kind = "SL" if inverted else "TP"
-        self.log(f"[{eng.label}] ABRE {direction} {symbol}{' (invertido)' if inverted else ''} | vela {candle.open:g}→{candle.close:g} "
+        self.log(f"[{eng.label}] ABRE {direction} {symbol}{' (invertido)' if inverted else ''}"
+                 f"{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | vela {candle.open:g}→{candle.close:g} "
                  f"({body:+.2f}% a los {age:.0f}s) | px={price:g} qty={qty:g} ({eff:.2f} USDT) | "
                  f"{kind} {pos.tp_price:g} | trade #{pos.trade_id}")
-        self.executor.send({
-            "action":    "open",
-            "trade_id":  pos.trade_id,
-            "symbol":    symbol,
-            "direction": direction,
-            "price":     price,
-            "quantity":  qty,
-            "notional":  round(eff, 4),
-            "level":     round(body, 4),
-            "strategy":  eng.name,
-        }, t0)
+        if pos.sent:
+            self.executor.send({
+                "action":    "open",
+                "trade_id":  pos.trade_id,
+                "symbol":    symbol,
+                "direction": direction,
+                "price":     price,
+                "quantity":  qty,
+                "notional":  round(eff, 4),
+                "level":     round(body, 4),
+                "strategy":  eng.name,
+            }, t0)
         eng._decide_ms.append(decide_ms)
 
     # ── Salidas: ticks de precio (hilo del WS de precios) ─────────────────────
@@ -1046,6 +1102,8 @@ class KlineBot:
             self.store.mark_dirty(True)
             self.log(f"[{eng.label}] CIERRA {pos.direction} {symbol} ({reason}) | entrada {pos.entry_price:g} → "
                      f"{price:g} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}) | trade #{pos.trade_id}")
+            if not pos.sent:
+                return True                     # simulada: el executor nunca la abrió
             self.executor.send({
                 "action":      "close",
                 "trade_id":    pos.trade_id,
@@ -1235,10 +1293,7 @@ class KlineBot:
             "name":           eng.name,
             "label":          eng.label,
             "hint":           ENGINE_HINTS[eng.name],
-            "config": {
-                "threshold_pct": eng.threshold_pct, "tp_pct": eng.tp_pct,
-                "block_long": eng.blocked[strategy.LONG], "block_short": eng.blocked[strategy.SHORT],
-            },
+            "config":         eng.settings(),
             "signal_count":   eng.signal_count,
             "opened_count":   eng.opened_count,
             "closed_count":   closed_count,
@@ -1257,6 +1312,7 @@ class KlineBot:
         realized, unreal = self.session_pnl()
         return {
             **self.global_settings(),
+            "open_count": self.open_count(),
             "session_realized": realized, "session_unrealized": unreal,
             "session_pnl": realized + unreal,
             "session_since": _utc(self.session_started_ts, "%m-%d %H:%M:%S"),
@@ -1432,6 +1488,16 @@ def api_global_set():
     vals = {}
     if "inverted" in data:
         vals["inverted"] = bool(data["inverted"])
+    if "executor_paused" in data:
+        vals["executor_paused"] = bool(data["executor_paused"])
+    if data.get("max_open") not in (None, ""):
+        try:
+            v = int(float(data["max_open"]))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "error": "max_open inválido"}), 400
+        if not 0 <= v <= 10_000:
+            return jsonify({"ok": False, "error": "max_open debe estar entre 0 y 10000"}), 400
+        vals["max_open"] = v
     for key, hi in (("profit_target_usd", 1_000_000), ("fee_pct", 1)):
         if data.get(key) in (None, ""):
             continue
@@ -1455,6 +1521,44 @@ def api_session_reset():
         return busy
     bot.reset_session("desde la web")
     return jsonify({"ok": True, **bot._global_snapshot()})
+
+
+@app.post("/api/pause")
+def api_pause():
+    """Pausa o reanuda un bot. Body JSON: {"engine": "close"|"live", "paused": true|false}."""
+    busy = _guard()
+    if busy:
+        return busy
+    data = request.get_json(silent=True) or {}
+    eng, err = _engine_param(data, default=None)
+    if err:
+        return err
+    if eng is None:
+        return jsonify({"ok": False, "error": "Falta engine (close o live)"}), 400
+    return jsonify({"ok": True, **bot.set_paused(eng, bool(data.get("paused")))})
+
+
+@app.post("/api/close-all")
+def api_close_all():
+    """Cierra TODAS las posiciones abiertas (?engine= o body engine para un solo bot)."""
+    busy = _guard()
+    if busy:
+        return busy
+    eng, err = _engine_param(request.get_json(silent=True) or {}, default=None)
+    if err:
+        return err
+    if not bot.loop or not bot.loop.is_running():
+        return jsonify({"ok": False, "error": "El loop del bot no está activo"}), 503
+
+    async def _run():
+        return bot.close_all(eng)
+
+    try:
+        closed, total = asyncio.run_coroutine_threadsafe(_run(), bot.loop).result(timeout=15)
+    except concurrent.futures.TimeoutError:
+        return jsonify({"ok": False, "error": "Tiempo de espera agotado"}), 504
+    msg = f"{closed} de {total} posición(es) cerrada(s)" if total else "No había posiciones abiertas"
+    return jsonify({"ok": True, "closed": closed, "total": total, "msg": msg})
 
 
 @app.post("/api/block")
@@ -1519,7 +1623,7 @@ def api_trades():
 TRADE_CSV_COLS = [
     "strategy", "trade_id", "symbol", "direction", "reason", "opened_ts", "closed_at_ts", "duration_s",
     "inverted", "signal_pct", "candle_age_s", "entry_price", "close_price", "qty", "notional", "tp_price",
-    "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
+    "sent", "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
     "time_to_mae_s", "high_price", "low_price",
 ]
 
@@ -1573,138 +1677,230 @@ HTML = r"""<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>BOTKLINE · velas 1m</title>
 <style>
-  :root { --bg:#0a0f1e; --card:#121a30; --line:#223052; --txt:#e8edf8; --muted:#8b9bbd;
-          --green:#34d399; --red:#f87171; --amber:#fbbf24; --blue:#60a5fa; }
+  :root { --bg:#0b1020; --panel:#121933; --panel2:#0f1630; --line:#26304f; --txt:#e8edf8; --muted:#8e9bbb;
+          --green:#34d399; --red:#f87171; --amber:#fbbf24; --blue:#60a5fa; --radius:14px; }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--txt); font:14px system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  body { margin:0; background:var(--bg); color:var(--txt); font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
          font-variant-numeric:tabular-nums; }
-  main { max-width:1200px; margin:0 auto; padding:16px; }
-  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:15px; margin:0 0 10px; }
+  main { max-width:1240px; margin:0 auto; padding:16px; }
   .muted { color:var(--muted); } .pos { color:var(--green); } .neg { color:var(--red); } .warn { color:var(--amber); }
-  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:10px; margin:14px 0; }
-  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px; margin-bottom:14px; }
-  .stat .label { color:var(--muted); font-size:12px; } .stat .v { font-size:18px; font-weight:700; margin-top:4px; word-break:break-all; }
+  small { font-size:12px; }
+
+  /* Cabecera */
+  .top { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:12px; }
+  .brand { font-size:20px; font-weight:800; letter-spacing:.3px; }
+  .brand small { font-weight:400; color:var(--muted); margin-left:6px; }
+  .pills { display:flex; flex-wrap:wrap; gap:6px; }
+  .pill { border:1px solid var(--line); background:var(--panel2); border-radius:999px; padding:3px 10px; font-size:12px; }
+  .pill.ok { border-color:rgba(52,211,153,.4); color:var(--green); }
+  .pill.bad { border-color:rgba(248,113,113,.4); color:var(--red); }
+  .pill.alert { border-color:rgba(251,191,36,.5); color:var(--amber); }
+  #rules { margin:-4px 0 12px; }
+
+  /* Tarjetas de cifras */
+  .kpis { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; margin-bottom:14px; }
+  .kpi { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); padding:12px 14px; }
+  .kpi .label { color:var(--muted); font-size:12px; }
+  .kpi .v { font-size:20px; font-weight:700; margin-top:2px; }
+  .bar { height:6px; background:var(--panel2); border-radius:99px; overflow:hidden; margin-top:8px; }
+  .bar > i { display:block; height:100%; width:0; background:var(--green); transition:width .4s; }
+
+  /* Secciones plegables */
+  details.panel { background:var(--panel); border:1px solid var(--line); border-radius:var(--radius); margin-bottom:12px; }
+  details.panel > summary { list-style:none; cursor:pointer; padding:12px 16px; font-weight:700; font-size:15px;
+                            display:flex; gap:8px; align-items:center; user-select:none; }
+  details.panel > summary::-webkit-details-marker { display:none; }
+  details.panel > summary::before { content:'▸'; color:var(--muted); transition:transform .15s; display:inline-block; width:12px; }
+  details.panel[open] > summary::before { transform:rotate(90deg); }
+  details.panel > summary .hint { font-weight:400; font-size:12px; color:var(--muted); }
+  details.panel > summary .badge { margin-left:auto; }
+  .body { padding:0 16px 14px; }
+  .badge { background:var(--panel2); border:1px solid var(--line); border-radius:999px; padding:1px 9px; font-size:12px; font-weight:600; }
+
+  /* Tarjetas de bots */
+  .bots { display:grid; grid-template-columns:repeat(auto-fit,minmax(300px,1fr)); gap:10px; }
+  .bot { background:var(--panel2); border:1px solid var(--line); border-radius:12px; padding:12px; }
+  .bot.sel { border-color:var(--blue); }
+  .bot.paused { opacity:.8; border-style:dashed; }
+  .bot h3 { margin:0; font-size:15px; display:flex; align-items:center; gap:8px; }
+  .bot .rows { display:grid; grid-template-columns:repeat(4,1fr); gap:6px; margin:10px 0; }
+  .bot .rows div { font-size:12px; color:var(--muted); } .bot .rows b { display:block; color:var(--txt); font-size:14px; }
+  .bot .acts { display:flex; gap:6px; flex-wrap:wrap; }
+
+  /* Tablas */
+  .scroll { overflow:auto; max-height:430px; border:1px solid var(--line); border-radius:10px; }
   table { width:100%; border-collapse:collapse; font-size:13px; }
-  th, td { padding:6px 8px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
+  th, td { padding:7px 9px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap; }
   th:first-child, td:first-child { text-align:left; }
-  th { color:var(--muted); font-weight:600; }
-  .scroll { overflow-x:auto; }
+  thead th { position:sticky; top:0; background:#162043; color:var(--muted); font-weight:600; z-index:1; }
+  tbody tr:hover td { background:rgba(96,165,250,.05); }
   .tag { padding:2px 8px; border-radius:999px; font-weight:700; font-size:11px; }
   .LONG { background:rgba(52,211,153,.15); color:var(--green); } .SHORT { background:rgba(248,113,113,.15); color:var(--red); }
-  form { display:flex; gap:8px; flex-wrap:wrap; }
-  input { flex:1 1 220px; background:#0e1630; color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:inherit; }
-  button { background:var(--blue); color:#06101f; border:0; border-radius:8px; padding:8px 14px; font-weight:700; cursor:pointer; }
-  button.small { padding:4px 10px; font-size:12px; background:#2a3658; color:var(--txt); }
-  .tabs { display:flex; gap:8px; flex-wrap:wrap; margin:6px 0 14px; position:sticky; top:0; z-index:2;
-          background:var(--bg); padding:8px 0; }
-  .tabs button { background:#2a3658; color:var(--txt); font-size:14px; padding:10px 16px; }
+  .st { padding:2px 8px; border-radius:999px; font-size:11px; font-weight:700; }
+  .st.on { background:rgba(52,211,153,.15); color:var(--green); } .st.off { background:rgba(251,191,36,.15); color:var(--amber); }
+
+  /* Formularios y botones */
+  form, .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input { flex:1 1 200px; background:var(--panel2); color:var(--txt); border:1px solid var(--line); border-radius:8px; padding:8px 10px; font:inherit; }
+  label.f { flex:1 1 200px; display:flex; flex-direction:column; gap:4px; font-size:12px; color:var(--muted); }
+  label.f input { flex:none; }
+  button { background:var(--blue); color:#06101f; border:0; border-radius:8px; padding:8px 14px; font-weight:700; cursor:pointer; font:inherit; font-weight:700; }
+  button:hover { filter:brightness(1.1); }
+  button.ghost { background:#24305a; color:var(--txt); }
+  button.danger { background:var(--red); color:#1a0606; }
+  button.ok { background:var(--green); }
+  button.warnb { background:var(--amber); }
+  button.small { padding:4px 10px; font-size:12px; }
+  .msg { margin-top:8px; min-height:18px; }
+  .sub { font-size:13px; font-weight:700; margin:14px 0 8px; color:var(--muted); }
+
+  /* Pestañas */
+  .tabs { display:flex; gap:8px; flex-wrap:wrap; position:sticky; top:0; z-index:5; background:var(--bg); padding:10px 0; margin:6px 0 4px; }
+  .tabs button { background:#24305a; color:var(--txt); padding:9px 16px; }
   .tabs button.on { background:var(--blue); color:#06101f; }
+  .tabs button.on .pos, .tabs button.on .neg { color:#06101f; }
   .tabs button * { pointer-events:none; }
-  tr.on td { background:rgba(96,165,250,.08); }
-  tr[data-engine] { cursor:pointer; }
-  #exMsg { margin-top:8px; min-height:18px; }
-  pre { margin:0; max-height:300px; overflow:auto; font-size:12px; color:var(--muted); white-space:pre-wrap; }
+  #engHint { margin:0 0 10px; }
+  pre { margin:0; max-height:320px; overflow:auto; font-size:12px; color:var(--muted); white-space:pre-wrap; }
+  @media (max-width:640px) { .bot .rows { grid-template-columns:repeat(2,1fr); } }
 </style>
 </head>
 <body>
 <main>
-  <h1>BOTKLINE <span class="muted" style="font-size:13px;font-weight:400">velas 1m · dos bots en paralelo que siguen la tendencia</span></h1>
+  <div class="top">
+    <div class="brand">BOTKLINE <small>velas 1m · dos bots en paralelo</small></div>
+    <div class="pills" id="pills"></div>
+  </div>
   <div class="muted" id="rules"></div>
 
-  <div class="grid">
-    <div class="card stat"><div class="label">Velas 1m</div><div class="v" id="sKl">—</div></div>
-    <div class="card stat"><div class="label">Velas evaluadas</div><div class="v" id="sEval">—</div></div>
-    <div class="card stat"><div class="label">PnL realizado (los dos)</div><div class="v" id="sRpnlAll">—</div></div>
-    <div class="card stat"><div class="label">Estado</div><div class="v" id="sState">—</div></div>
-  </div>
+  <section class="kpis">
+    <div class="kpi"><div class="label">PnL de la sesión <span id="sessTarget"></span></div><div class="v" id="sessPnl">—</div>
+      <div class="bar"><i id="sessBar"></i></div><small class="muted" id="sessDetail"></small></div>
+    <div class="kpi"><div class="label">PnL realizado (total)</div><div class="v" id="sRpnlAll">—</div><small class="muted" id="sWins"></small></div>
+    <div class="kpi"><div class="label">PnL abierto (total)</div><div class="v" id="sUpnlAll">—</div></div>
+    <div class="kpi"><div class="label">Posiciones abiertas</div><div class="v" id="sOpen">—</div><small class="muted" id="sOpenLim"></small></div>
+    <div class="kpi"><div class="label">Velas 1m</div><div class="v" id="sKl">—</div><small class="muted" id="sEval"></small></div>
+  </section>
 
-  <div class="card">
-    <h2>Modo y objetivo <span class="muted" style="font-size:12px;font-weight:400">(común a los dos bots)</span></h2>
-    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
-      <button type="button" id="btnInvert" style="font-size:15px;padding:10px 18px">—</button>
-      <span class="muted" id="modeHint"></span>
+  <details class="panel" data-key="control" open>
+    <summary>Control <span class="hint">pausar bots, invertir, cerrar todo, objetivo y límite</span></summary>
+    <div class="body">
+      <div class="bots" id="bots"></div>
+
+      <div class="sub">Acciones para los dos bots</div>
+      <div class="row">
+        <button type="button" id="btnInvert">—</button>
+        <button type="button" class="danger" id="btnCloseAll">Cerrar TODAS las posiciones</button>
+        <button type="button" id="btnExPause">—</button>
+        <button type="button" class="ghost" id="btnReset">Poner a cero el PnL de la sesión</button>
+      </div>
+      <div class="muted" id="modeHint" style="margin-top:8px"></div>
+      <div class="muted" id="sessHits" style="margin-top:4px"></div>
+
+      <div class="sub">Ajustes</div>
+      <form id="glbForm">
+        <label class="f">Objetivo en USD para cerrar todo (0 = apagado) <span id="curTarget"></span>
+          <input id="glbTarget" type="number" step="0.01" min="0" placeholder="ej. 12"></label>
+        <label class="f">Límite de posiciones abiertas, los dos bots (0 = sin límite) <span id="curMax"></span>
+          <input id="glbMax" type="number" step="1" min="0" placeholder="ej. 10"></label>
+        <label class="f">Fee % por lado <span id="curFee"></span>
+          <input id="glbFee" type="number" step="0.001" min="0" max="1" placeholder="ej. 0.05"></label>
+        <button type="submit" style="align-self:flex-end">Guardar</button>
+      </form>
+      <div class="row" style="margin-top:8px" id="tokenRow">
+        <input id="exToken" type="password" placeholder="Token admin (si está configurado)" autocomplete="off" style="display:none;max-width:320px">
+      </div>
+      <div id="glbMsg" class="muted msg"></div>
     </div>
-    <div style="margin-top:12px">PnL de la sesión (realizado + abierto, con fees):
-      <b id="sessPnl" style="font-size:18px">—</b> <span class="muted">de</span> <b id="sessTarget">—</b>
-      <span class="muted" id="sessDetail"></span>
-      <button type="button" class="small" id="btnReset">Poner a cero</button></div>
-    <div class="muted" id="sessHits" style="margin-top:4px"></div>
-    <form id="glbForm" style="margin-top:10px">
-      <input id="glbTarget" type="number" step="0.01" min="0" placeholder="Objetivo en USD para cerrar todo (ej. 12; 0 = apagado)">
-      <input id="glbFee" type="number" step="0.001" min="0" max="1" placeholder="Fee % por lado (ej. 0.05)">
-      <button type="submit">Guardar</button>
-    </form>
-    <div id="glbMsg" class="muted" style="margin-top:8px;min-height:18px"></div>
-  </div>
-
-  <div class="card"><h2>Los dos bots</h2><div class="scroll"><table>
-    <thead><tr><th>Bot</th><th>Entra</th><th>Señal</th><th>Salida</th><th>Bloqueados</th><th>Señales / abiertas</th><th>Abiertas</th><th>Cerradas (gan.)</th><th>PnL abierto</th><th>PnL realizado</th></tr></thead>
-    <tbody id="tEng"></tbody></table></div></div>
-
-  <div class="card">
-    <h2>Executor <span class="muted" style="font-size:12px;font-weight:400">(común a los dos bots)</span></h2>
-    <div class="muted">Actual: <b id="exUrl">—</b> · enviadas <span id="exSent">0</span> · errores <span id="exErr">0</span></div>
-    <div class="muted" id="exLat" style="margin-top:4px"></div>
-    <form id="exForm" style="margin-top:10px">
-      <input id="exNew" type="url" placeholder="https://mi-executor.onrender.com" autocomplete="off">
-      <input id="exSecret" type="password" placeholder="Secreto (opcional, vacío = mantener)" autocomplete="off">
-      <input id="exToken" type="password" placeholder="Token admin" autocomplete="off" style="display:none">
-      <button type="submit">Cambiar link</button>
-    </form>
-    <div id="exMsg" class="muted"></div>
-  </div>
+  </details>
 
   <div class="tabs" id="tabs"></div>
-  <div class="muted" id="engHint" style="margin:-6px 0 12px"></div>
+  <div class="muted" id="engHint"></div>
 
-  <div class="grid">
-    <div class="card stat"><div class="label">Señales / abiertas</div><div class="v" id="sSig">—</div></div>
-    <div class="card stat"><div class="label">Posiciones abiertas</div><div class="v" id="sPos">—</div></div>
-    <div class="card stat"><div class="label">PnL abierto</div><div class="v" id="sUpnl">—</div></div>
-    <div class="card stat"><div class="label">PnL realizado</div><div class="v" id="sRpnl">—</div></div>
-  </div>
-
-  <div class="card">
-    <h2>Parámetros · <span class="engName"></span> (en caliente)</h2>
-    <div class="muted">Señal actual: <b id="cfgThr">—</b> · <span id="cfgTpLbl">TP</span> actual: <b id="cfgTp">—</b> · <span id="engLat"></span></div>
-    <form id="cfgForm" style="margin-top:10px">
-      <input id="cfgNewThr" type="number" step="0.01" min="0.01" max="100" placeholder="% cuerpo de vela para entrar (ej. 3)">
-      <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (normal) / stop loss (invertido), ej. 2">
-      <button type="submit">Guardar</button>
-    </form>
-    <div id="cfgMsg" class="muted" style="margin-top:8px;min-height:18px"></div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:6px">
-      <button type="button" id="btnLong" data-block="LONG">LONG</button>
-      <button type="button" id="btnShort" data-block="SHORT">SHORT</button>
-      <span class="muted" style="align-self:center">Solo afecta a este bot. Bloquear una dirección frena las entradas nuevas; las abiertas siguen hasta su TP.</span>
+  <details class="panel" data-key="pos" open>
+    <summary>Posiciones abiertas · <span class="engName"></span> <span class="badge" id="nPos">0</span></summary>
+    <div class="body">
+      <div class="row" style="margin-bottom:8px">
+        <span class="muted" id="engPnl"></span>
+        <button type="button" class="danger small" id="btnCloseEng" style="margin-left:auto">Cerrar todas las de este bot</button>
+      </div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>Salida</th><th>Notional</th><th>PnL neto</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
+        <tbody id="tPos"></tbody></table></div>
     </div>
-  </div>
+  </details>
 
-  <div class="card"><h2>Posiciones abiertas · <span class="engName"></span></h2><div class="scroll"><table>
-    <thead><tr><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Entrada</th><th>Precio</th><th>Avance</th><th>Salida</th><th>Notional</th><th>PnL neto</th><th>MFE</th><th>MAE</th><th>Abierta</th><th></th></tr></thead>
-    <tbody id="tPos"></tbody></table></div></div>
+  <details class="panel" data-key="cfg">
+    <summary>Parámetros · <span class="engName"></span> <span class="hint" id="cfgSum"></span></summary>
+    <div class="body">
+      <div class="muted">Señal actual: <b id="cfgThr">—</b> · <span id="cfgTpLbl">TP</span> actual: <b id="cfgTp">—</b> · <span id="engLat"></span></div>
+      <form id="cfgForm" style="margin-top:10px">
+        <input id="cfgNewThr" type="number" step="0.01" min="0.01" max="100" placeholder="% cuerpo de vela para entrar (ej. 3)">
+        <input id="cfgNewTp" type="number" step="0.01" min="0.01" max="100" placeholder="% take profit (normal) / stop loss (invertido)">
+        <button type="submit">Guardar</button>
+      </form>
+      <div id="cfgMsg" class="muted msg"></div>
+      <div class="row">
+        <button type="button" id="btnLong" data-block="LONG">LONG</button>
+        <button type="button" id="btnShort" data-block="SHORT">SHORT</button>
+        <span class="muted">Solo afecta a este bot. Bloquear frena las entradas nuevas de esa dirección.</span>
+      </div>
+    </div>
+  </details>
 
-  <div class="card"><h2>MFE / MAE de las cerradas · <span class="engName"></span> <a id="csvLink" class="muted" style="font-size:12px;font-weight:400" href="/api/trades.csv">descargar CSV</a></h2><div class="scroll"><table>
-    <thead><tr><th>Dirección</th><th>Ops</th><th>Ganadas</th><th>MFE medio</th><th>MAE medio</th><th>Mejor MFE</th><th>Peor MAE</th><th>MAE medio USD</th><th>Hasta MAE</th><th>Duración media</th></tr></thead>
-    <tbody id="tExc"></tbody></table></div></div>
+  <details class="panel" data-key="sig">
+    <summary>Señales recientes · <span class="engName"></span> <span class="badge" id="nSig">0</span></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Cuerpo</th><th>Segundo</th><th>Acción</th></tr></thead>
+      <tbody id="tSig"></tbody></table></div></div>
+  </details>
 
-  <div class="card"><h2>Señales recientes · <span class="engName"></span></h2><div class="scroll"><table>
-    <thead><tr><th>Hora</th><th>Símbolo</th><th>Dir.</th><th>Vela</th><th>Cuerpo</th><th>Segundo</th><th>Acción</th></tr></thead>
-    <tbody id="tSig"></tbody></table></div></div>
+  <details class="panel" data-key="closed">
+    <summary>Operaciones cerradas · <span class="engName"></span> <span class="badge" id="nClosed">0</span></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL neto</th><th>Fees</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
+      <tbody id="tClosed"></tbody></table></div></div>
+  </details>
 
-  <div class="card"><h2>Operaciones cerradas · <span class="engName"></span></h2><div class="scroll"><table>
-    <thead><tr><th>Cierre</th><th>Símbolo</th><th>Dir.</th><th>Entrada</th><th>Salida</th><th>Avance</th><th>PnL neto</th><th>Fees</th><th>MFE</th><th>MAE</th><th>Duración</th><th>Motivo</th></tr></thead>
-    <tbody id="tClosed"></tbody></table></div></div>
+  <details class="panel" data-key="exc">
+    <summary>MFE / MAE de las cerradas · <span class="engName"></span> <a id="csvLink" class="hint" href="/api/trades.csv" onclick="event.stopPropagation()">descargar CSV</a></summary>
+    <div class="body"><div class="scroll"><table>
+      <thead><tr><th>Dirección</th><th>Ops</th><th>Ganadas</th><th>MFE medio</th><th>MAE medio</th><th>Mejor MFE</th><th>Peor MAE</th><th>MAE medio USD</th><th>Hasta MAE</th><th>Duración media</th></tr></thead>
+      <tbody id="tExc"></tbody></table></div></div>
+  </details>
 
-  <div class="card"><h2>Evaluaciones · mayores cuerpos de la vela cerrada <span id="evMin"></span></h2><div class="scroll"><table>
-    <thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Cuerpo</th><th>Señal con el umbral de <span class="engName"></span></th></tr></thead>
-    <tbody id="tTop"></tbody></table></div></div>
+  <details class="panel" data-key="eval">
+    <summary>Evaluaciones <span class="hint">cuerpo al cierre, con el umbral de <span class="engName"></span></span></summary>
+    <div class="body">
+      <div class="sub" style="margin-top:0">Mayores cuerpos de la vela <span id="evMin"></span></div>
+      <div class="scroll"><table>
+        <thead><tr><th>Símbolo</th><th>Apertura</th><th>Cierre</th><th>Cuerpo</th><th>Señal</th></tr></thead>
+        <tbody id="tTop"></tbody></table></div>
+      <div class="sub">Por minuto</div>
+      <div class="scroll"><table>
+        <thead><tr><th>Vela</th><th>Evaluadas</th><th>≥ umbral (LONG)</th><th>≤ −umbral (SHORT)</th><th>Mayor subida</th><th>Mayor caída</th></tr></thead>
+        <tbody id="tMin"></tbody></table></div>
+    </div>
+  </details>
 
-  <div class="card"><h2>Evaluaciones por minuto <span class="muted" style="font-size:12px;font-weight:400">(cuerpo al cierre, con el umbral de <span class="engName"></span>)</span></h2><div class="scroll"><table>
-    <thead><tr><th>Vela</th><th>Evaluadas</th><th>≥ umbral (LONG)</th><th>≤ −umbral (SHORT)</th><th>Mayor subida</th><th>Mayor caída</th></tr></thead>
-    <tbody id="tMin"></tbody></table></div></div>
+  <details class="panel" data-key="exec">
+    <summary>Executor <span class="hint" id="exSum"></span></summary>
+    <div class="body">
+      <div class="muted">Actual: <b id="exUrl">—</b> · enviadas <span id="exSent">0</span> · errores <span id="exErr">0</span></div>
+      <div class="muted" id="exLat" style="margin-top:4px"></div>
+      <form id="exForm" style="margin-top:10px">
+        <input id="exNew" type="url" placeholder="https://mi-executor.onrender.com" autocomplete="off">
+        <input id="exSecret" type="password" placeholder="Secreto (opcional, vacío = mantener)" autocomplete="off">
+        <button type="submit">Cambiar link</button>
+      </form>
+      <div id="exMsg" class="muted msg"></div>
+    </div>
+  </details>
 
-  <div class="card"><h2>Eventos <span class="muted" style="font-size:12px;font-weight:400">(los dos bots)</span></h2><pre id="events"></pre></div>
+  <details class="panel" data-key="events">
+    <summary>Eventos <span class="hint">los dos bots</span></summary>
+    <div class="body"><pre id="events"></pre></div>
+  </details>
 </main>
 <script>
 const q = id => document.getElementById(id);
@@ -1715,9 +1911,18 @@ const usd = v => `<span class="${v >= 0 ? 'pos' : 'neg'}">${v >= 0 ? '+' : ''}${
 const dur = s => { s = Math.floor(s); const h = Math.floor(s/3600), m = Math.floor(s%3600/60);
                    return h ? `${h}h ${m}m` : m ? `${m}m ${s%60}s` : `${s}s`; };
 const tag = d => `<span class="tag ${esc(d)}">${esc(d)}</span>`;
-let token = '', cur = 'close', last = null;
-try { token = localStorage.getItem('botkline_token') || ''; cur = localStorage.getItem('botkline_engine') || 'close'; } catch (e) {}
-q('exToken').value = token;
+const store = {get(k, d) { try { const v = localStorage.getItem(k); return v === null ? d : v; } catch (e) { return d; } },
+               set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }};
+let cur = store.get('botkline_engine', 'close'), last = null;
+q('exToken').value = store.get('botkline_token', '');
+
+// Secciones plegables: se recuerda cuáles están abiertas.
+const folds = JSON.parse(store.get('botkline_folds', '{}') || '{}');
+document.querySelectorAll('details.panel').forEach(d => {
+  const k = d.dataset.key;
+  if (k in folds) d.open = folds[k];
+  d.addEventListener('toggle', () => { folds[k] = d.open; store.set('botkline_folds', JSON.stringify(folds)); });
+});
 
 function headers() {
   const h = {'Content-Type': 'application/json'};
@@ -1725,7 +1930,11 @@ function headers() {
   if (t) h['X-Admin-Token'] = t;
   return h;
 }
-function saveToken() { try { localStorage.setItem('botkline_token', q('exToken').value.trim()); } catch (e) {} }
+async function post(url, body) {
+  store.set('botkline_token', q('exToken').value.trim());
+  const r = await fetch(url, {method: 'POST', headers: headers(), body: JSON.stringify(body || {})});
+  return r.json();
+}
 
 async function refresh() {
   try { last = await (await fetch('/api/status', {cache: 'no-store'})).json(); } catch (e) { return; }
@@ -1733,90 +1942,115 @@ async function refresh() {
 }
 
 function render(d) {
-  const c = d.config, names = Object.keys(d.engines);
+  const c = d.config, g = d.global, names = Object.keys(d.engines);
   if (!d.engines[cur]) cur = names[0];
-  const e = d.engines[cur], ec = e.config;
-  const g = d.global;
+  const e = d.engines[cur], ec = e.config, xk = g.inverted ? 'SL' : 'TP';
+  const sum = f => names.reduce((s, n) => s + f(d.engines[n]), 0);
+
+  // Cabecera
+  const k = d.klines, p = d.persistence || {}, x = d.executor;
+  q('pills').innerHTML = [
+    `<span class="pill ${g.inverted ? 'alert' : 'ok'}">${g.inverted ? 'Modo INVERTIDO' : 'Modo normal'}</span>`,
+    ...names.map(n => `<span class="pill ${d.engines[n].config.paused ? 'alert' : 'ok'}">${esc(d.engines[n].label)}: ${d.engines[n].config.paused ? 'pausado' : 'en marcha'}</span>`),
+    `<span class="pill ${k.active ? 'ok' : 'bad'}">Velas ${k.active ? 'conectadas' : 'desconectadas'}</span>`,
+    `<span class="pill ${!x.url ? 'bad' : g.executor_paused ? 'alert' : (x.errors && x.last_error ? 'alert' : 'ok')}">Executor ${!x.url ? 'sin link' : g.executor_paused ? 'PAUSADO (prueba)' : 'activo'}</span>`,
+    `<span class="pill ${p.mode === 'ok' || p.mode === 'local' ? 'ok' : 'alert'}">Estado ${esc(p.mode)}</span>`,
+  ].join('');
   q('rules').textContent = g.inverted
-    ? `MODO INVERTIDO: cuerpo de la vela 1m ≥ umbral → entra CONTRA la vela · el % es stop loss, sin TP · ${c.notional} USDT por entrada · PnL con fee ${g.fee_pct}% por lado`
-    : `Cuerpo de la vela 1m ≥ umbral → sigue la tendencia · el % es take profit, sin stop loss · ${c.notional} USDT por entrada · PnL con fee ${g.fee_pct}% por lado`;
+    ? `Cuerpo de la vela 1m ≥ umbral → entra CONTRA la vela · el % es stop loss, sin TP · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`
+    : `Cuerpo de la vela 1m ≥ umbral → sigue la tendencia · el % es take profit, sin stop loss · ${c.notional} USDT por entrada · fee ${g.fee_pct}% por lado`;
+
+  // Cifras
+  q('sessPnl').innerHTML = usd(g.session_pnl);
+  q('sessTarget').textContent = g.profit_target_usd > 0 ? `· objetivo +${g.profit_target_usd} USD` : '· objetivo apagado';
+  q('sessBar').style.width = g.profit_target_usd > 0 ? `${Math.max(0, Math.min(100, g.session_pnl / g.profit_target_usd * 100))}%` : '0';
+  q('sessDetail').innerHTML = `realizado ${usd(g.session_realized)} + abierto ${usd(g.session_unrealized)} · desde ${esc(g.session_since)}`;
+  q('sRpnlAll').innerHTML = usd(sum(n => n.realized_pnl));
+  q('sWins').textContent = `${sum(n => n.wins)}/${sum(n => n.closed_count)} ganadas · netas de fees`;
+  q('sUpnlAll').innerHTML = usd(sum(n => n.unrealized_pnl));
+  q('sOpen').textContent = g.open_count;
+  q('sOpenLim').textContent = g.max_open > 0 ? `límite ${g.max_open}` : 'sin límite';
+  q('sKl').innerHTML = `${k.with_data}/${k.symbols}`;
+  q('sEval').textContent = `${k.active}/${k.connections} conexiones · ${d.eval_total.toLocaleString('es')} velas evaluadas`;
+
+  // Control
+  q('bots').innerHTML = names.map(n => { const b = d.engines[n], bc = b.config;
+    const bl = [bc.block_long && 'LONG', bc.block_short && 'SHORT'].filter(Boolean).join(', ');
+    return `<div class="bot ${n === cur ? 'sel' : ''} ${bc.paused ? 'paused' : ''}">
+      <h3>${esc(b.label)} <span class="st ${bc.paused ? 'off' : 'on'}">${bc.paused ? 'PAUSADO' : 'EN MARCHA'}</span></h3>
+      <div class="muted" style="font-size:12px;margin-top:2px">${esc(b.hint)}</div>
+      <div class="rows">
+        <div>Señal<b>±${bc.threshold_pct}%</b></div><div>${xk}<b>${bc.tp_pct}%</b></div>
+        <div>Abiertas<b>${b.positions.length}</b></div><div>Bloqueados<b class="${bl ? 'neg' : ''}">${bl || '—'}</b></div>
+        <div>Señales / abiertas<b>${b.signal_count} / ${b.opened_count}</b></div><div>Cerradas<b>${b.closed_count} (${b.wins} gan.)</b></div>
+        <div>PnL abierto<b>${usd(b.unrealized_pnl)}</b></div><div>PnL realizado<b>${usd(b.realized_pnl)}</b></div>
+      </div>
+      <div class="acts">
+        <button type="button" class="small ${bc.paused ? 'ok' : 'warnb'}" data-pause="${esc(n)}" data-paused="${bc.paused ? '1' : ''}">${bc.paused ? 'Reanudar' : 'Pausar'}</button>
+        <button type="button" class="small ghost" data-engine="${esc(n)}">Ver detalle</button>
+      </div></div>`; }).join('');
   const bi = q('btnInvert');
   bi.dataset.inverted = g.inverted ? '1' : '';
   bi.textContent = g.inverted ? 'Modo INVERTIDO · volver a normal' : 'Modo normal · invertir';
-  bi.style.background = g.inverted ? 'var(--amber)' : 'var(--green)';
-  q('modeHint').textContent = g.inverted
-    ? 'Vela verde → SHORT, roja → LONG. El % de cada bot es stop loss; no hay TP.'
-    : 'Vela verde → LONG, roja → SHORT. El % de cada bot es take profit; no hay stop loss.';
-  q('sessPnl').innerHTML = usd(g.session_pnl);
-  q('sessTarget').textContent = g.profit_target_usd > 0 ? `+${g.profit_target_usd} USD` : 'objetivo apagado';
-  q('sessDetail').innerHTML = `(realizado ${usd(g.session_realized)} + abierto ${usd(g.session_unrealized)}, desde ${esc(g.session_since)})`;
+  bi.className = g.inverted ? 'warnb' : 'ok';
+  const bx = q('btnExPause');
+  bx.dataset.paused = g.executor_paused ? '1' : '';
+  bx.textContent = g.executor_paused ? 'Envíos al executor PAUSADOS · reanudar' : 'Pausar entradas al executor (prueba)';
+  bx.className = g.executor_paused ? 'warnb' : 'ghost';
+  q('modeHint').textContent = (g.executor_paused ? 'MODO PRUEBA: las entradas nuevas solo se simulan aquí, no se mandan al executor. ' : '') + (g.inverted
+    ? 'Invertido: vela verde → SHORT, roja → LONG. El % de cada bot es stop loss; no hay TP.'
+    : 'Normal: vela verde → LONG, roja → SHORT. El % de cada bot es take profit; no hay stop loss.');
   q('sessHits').textContent = g.target_hits ? `Objetivo alcanzado ${g.target_hits} vez/veces · último: ${g.last_target || '—'}` : 'Al llegar al objetivo se cierran todas las posiciones de los dos bots y el contador vuelve a cero.';
-  const xk = g.inverted ? 'SL' : 'TP';
+  q('curTarget').textContent = `(ahora ${g.profit_target_usd > 0 ? '+' + g.profit_target_usd : 'apagado'})`;
+  q('curMax').textContent = `(ahora ${g.max_open > 0 ? g.max_open : 'sin límite'})`;
+  q('curFee').textContent = `(ahora ${g.fee_pct}%)`;
   q('exToken').style.display = c.admin_token ? '' : 'none';
-  const k = d.klines;
-  q('sKl').innerHTML = `${k.with_data}/${k.symbols} <span class="muted" style="font-size:12px">${k.active}/${k.connections} conex.</span>`;
-  q('sEval').textContent = d.eval_total.toLocaleString('es');
-  q('sRpnlAll').innerHTML = usd(names.reduce((s, n) => s + d.engines[n].realized_pnl, 0));
-  const p = d.persistence || {};
-  q('sState').innerHTML = `<span class="${p.mode === 'ok' || p.mode === 'local' ? 'pos' : 'warn'}">${esc(p.mode)}</span>`;
+  q('tokenRow').style.display = c.admin_token ? '' : 'none';
 
-  q('tEng').innerHTML = names.map(n => { const x = d.engines[n], xc = x.config;
-    const bl = [xc.block_long && 'LONG', xc.block_short && 'SHORT'].filter(Boolean).join(', ');
-    return `<tr data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}"><td><b>${esc(x.label)}</b></td><td class="muted">${n === 'live' ? 'vela abierta' : 'al cierre'}</td>
-      <td>±${xc.threshold_pct}%</td><td>${xk} ${xc.tp_pct}%</td><td class="${bl ? 'neg' : 'muted'}">${bl || 'ninguno'}</td>
-      <td>${x.signal_count} / ${x.opened_count}</td><td>${x.positions.length}</td><td>${x.closed_count} (${x.wins})</td>
-      <td>${usd(x.unrealized_pnl)}</td><td>${usd(x.realized_pnl)}</td></tr>`; }).join('');
-  q('tabs').innerHTML = names.map(n => { const x = d.engines[n];
-    return `<button type="button" data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}">${esc(x.label)} <span>· ${x.positions.length} abiertas · </span>${usd(x.realized_pnl)}</button>`; }).join('');
+  // Pestañas
+  q('tabs').innerHTML = names.map(n => { const b = d.engines[n];
+    return `<button type="button" data-engine="${esc(n)}" class="${n === cur ? 'on' : ''}">${esc(b.label)}${b.config.paused ? ' (pausado)' : ''} <span>· ${b.positions.length} abiertas · </span>${usd(b.realized_pnl)}</button>`; }).join('');
   q('engHint').textContent = `${e.label}: ${e.hint}.`;
   document.querySelectorAll('.engName').forEach(el => el.textContent = e.label);
   q('csvLink').href = '/api/trades.csv?engine=' + encodeURIComponent(cur);
 
-  q('exUrl').textContent = d.executor.url || '(vacío: sin señales)';
-  q('exSent').textContent = d.executor.sent;
-  q('exErr').textContent = d.executor.errors;
-  const x = d.executor;
-  q('exLat').textContent = x.last_ok
-    ? `Última señal (${x.last_ok}): HTTP al executor ${x.http_ms} ms · total desde el mensaje de Binance ${x.total_ms} ms`
-    : 'Latencia: aún no hay señales enviadas';
-  q('engLat').textContent = e.decide_ms === null ? 'decisión: sin entradas aún' : `decisión media ${e.decide_ms} ms`;
-
-  q('cfgThr').textContent = `±${ec.threshold_pct}%`;
-  q('cfgTp').textContent = `${ec.tp_pct}%`;
-  q('cfgTpLbl').textContent = xk;
-  q('sSig').textContent = `${e.signal_count} / ${e.opened_count}`;
-  q('sPos').textContent = e.positions.length;
-  q('sUpnl').innerHTML = usd(e.unrealized_pnl);
-  q('sRpnl').innerHTML = `${usd(e.realized_pnl)} <span class="muted" style="font-size:12px">${e.wins}/${e.closed_count} gan.</span>`;
-
-  const ev = e.evaluations;
-  q('evMin').textContent = ev.top_minute;
-  q('tTop').innerHTML = ev.top.map(r => `<tr><td>${esc(r.symbol)}</td><td>${num(r.open, 8)}</td><td>${num(r.close, 8)}</td>
-    <td>${pct(r.body_pct)}</td><td>${r.signal ? tag(r.signal) : '<span class="muted">—</span>'}</td></tr>`).join('')
-    || '<tr><td colspan="5" class="muted">Esperando el primer cierre de vela</td></tr>';
-  q('tMin').innerHTML = ev.minutes.map(m => `<tr><td>${esc(m.minute)}</td><td>${m.evaluated}</td><td>${m.long}</td><td>${m.short}</td>
-    <td>${pct(m.max_up)}</td><td>${pct(m.max_down)}</td></tr>`).join('')
-    || '<tr><td colspan="6" class="muted">Sin evaluaciones todavía</td></tr>';
-
+  // Posiciones
+  q('nPos').textContent = e.positions.length;
+  q('engPnl').innerHTML = `PnL abierto ${usd(e.unrealized_pnl)} · realizado ${usd(e.realized_pnl)} (${e.wins}/${e.closed_count} ganadas)`;
   q('tPos').innerHTML = e.positions.map(r => `<tr>
-    <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span></td><td>${tag(r.direction)}</td>
+    <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span>${r.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td><td>${tag(r.direction)}</td>
     <td>${pct(r.signal_pct)}${cur === 'live' ? ` <span class="muted">${Math.round(r.candle_age_s || 0)}s</span>` : ''}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
     <td>${pct(r.move_pct)}</td><td><span class="muted">${r.inverted ? 'SL' : 'TP'}</span> ${num(r.tp_price, 8)}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
     <td>${pct(r.mfe_pct)} <span class="muted">${usd(r.mfe_usd)}</span></td><td>${pct(r.mae_pct)} <span class="muted">${usd(r.mae_usd)}</span></td>
     <td>${esc(r.opened)} <span class="muted">(${dur(r.age_s)})</span></td>
-    <td><button class="small" data-close="${r.trade_id}" data-label="${esc(r.direction)} ${esc(r.symbol)} #${r.trade_id}">Cerrar</button></td></tr>`).join('')
+    <td><button class="small ghost" data-close="${r.trade_id}" data-label="${esc(r.direction)} ${esc(r.symbol)} #${r.trade_id}">Cerrar</button></td></tr>`).join('')
     || '<tr><td colspan="13" class="muted">Sin posiciones abiertas</td></tr>';
 
+  // Parámetros
+  q('cfgThr').textContent = `±${ec.threshold_pct}%`;
+  q('cfgTp').textContent = `${ec.tp_pct}%`;
+  q('cfgTpLbl').textContent = xk;
+  q('cfgSum').textContent = `señal ±${ec.threshold_pct}% · ${xk} ${ec.tp_pct}%`;
+  q('engLat').textContent = e.decide_ms === null ? 'decisión: sin entradas aún' : `decisión media ${e.decide_ms} ms`;
+  for (const [id, dir, blocked] of [['btnLong', 'LONG', ec.block_long], ['btnShort', 'SHORT', ec.block_short]]) {
+    const b = q(id);
+    b.dataset.blocked = blocked ? '1' : '';
+    b.textContent = blocked ? `${dir} bloqueados · desbloquear` : `${dir} activos · bloquear`;
+    b.className = blocked ? 'danger' : 'ok';
+  }
+
+  // Señales y cerradas
+  q('nSig').textContent = e.signal_count;
   q('tSig').innerHTML = e.signals.map(s => `<tr><td>${esc(s.time)}</td><td>${esc(s.symbol)}</td><td>${tag(s.direction)}</td>
     <td>${esc(s.candle)} <span class="muted">${num(s.open, 8)}→${num(s.close, 8)}</span></td><td>${pct(s.body_pct)}</td>
     <td class="muted">${Math.round(s.candle_age_s || 0)}s</td>
     <td class="${s.action.startsWith('abierta') ? 'pos' : 'muted'}">${esc(s.action)}</td></tr>`).join('')
     || `<tr><td colspan="7" class="muted">Esperando velas con cuerpo ≥ ±${ec.threshold_pct}%</td></tr>`;
-
+  q('nClosed').textContent = e.closed_count;
   q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
     <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
     <td class="muted">${num(t.fees || 0, 4)}</td><td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
-    <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}</td></tr>`).join('')
+    <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}${t.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td></tr>`).join('')
     || '<tr><td colspan="12" class="muted">Aún no hay cierres</td></tr>';
 
   const exc = e.excursions;
@@ -1828,13 +2062,24 @@ function render(d) {
       <td>${dur(r.avg_time_to_mae_s)}</td><td>${dur(r.avg_duration_s)}</td></tr>`;
   }).join('');
 
-  for (const [id, dir, blocked] of [['btnLong', 'LONG', ec.block_long], ['btnShort', 'SHORT', ec.block_short]]) {
-    const b = q(id);
-    b.dataset.blocked = blocked ? '1' : '';
-    b.textContent = blocked ? `${dir} bloqueados · desbloquear` : `${dir} activos · bloquear`;
-    b.style.background = blocked ? 'var(--red)' : 'var(--green)';
-  }
+  // Evaluaciones
+  const ev = e.evaluations;
+  q('evMin').textContent = ev.top_minute;
+  q('tTop').innerHTML = ev.top.map(r => `<tr><td>${esc(r.symbol)}</td><td>${num(r.open, 8)}</td><td>${num(r.close, 8)}</td>
+    <td>${pct(r.body_pct)}</td><td>${r.signal ? tag(r.signal) : '<span class="muted">—</span>'}</td></tr>`).join('')
+    || '<tr><td colspan="5" class="muted">Esperando el primer cierre de vela</td></tr>';
+  q('tMin').innerHTML = ev.minutes.map(m => `<tr><td>${esc(m.minute)}</td><td>${m.evaluated}</td><td>${m.long}</td><td>${m.short}</td>
+    <td>${pct(m.max_up)}</td><td>${pct(m.max_down)}</td></tr>`).join('')
+    || '<tr><td colspan="6" class="muted">Sin evaluaciones todavía</td></tr>';
 
+  // Executor y eventos
+  q('exUrl').textContent = x.url || '(vacío: sin señales)';
+  q('exSum').textContent = x.url ? `${x.url} · ${x.sent} enviadas · ${x.errors} errores` : 'sin link: no se mandan señales';
+  q('exSent').textContent = x.sent;
+  q('exErr').textContent = x.errors;
+  q('exLat').textContent = x.last_ok
+    ? `Última señal (${x.last_ok}): HTTP al executor ${x.http_ms} ms · total desde el mensaje de Binance ${x.total_ms} ms`
+    : 'Latencia: aún no hay señales enviadas';
   q('events').textContent = d.events.join('\n');
 }
 
@@ -1843,11 +2088,10 @@ q('exForm').addEventListener('submit', async ev => {
   const body = {url: q('exNew').value.trim()};
   const secret = q('exSecret').value;
   if (secret) body.secret = secret;
-  saveToken();
   if (!body.url && !confirm('Link vacío: los dos bots dejarán de mandar señales. ¿Seguir?')) return;
   q('exMsg').textContent = 'Guardando…';
   try {
-    const r = await (await fetch('/api/executor', {method: 'POST', headers: headers(), body: JSON.stringify(body)})).json();
+    const r = await post('/api/executor', body);
     q('exMsg').innerHTML = r.ok
       ? `<span class="pos">Link cambiado.</span> ${r.url ? (r.reachable ? 'El executor responde (' + esc(r.detail) + ').' : '<span class="warn">No responde: ' + esc(r.detail) + '</span>') : esc(r.detail)}`
       : `<span class="neg">${esc(r.error)}</span>`;
@@ -1858,11 +2102,9 @@ q('exForm').addEventListener('submit', async ev => {
 
 q('cfgForm').addEventListener('submit', async ev => {
   ev.preventDefault();
-  const body = {engine: cur, threshold_pct: q('cfgNewThr').value, tp_pct: q('cfgNewTp').value};
-  saveToken();
   q('cfgMsg').textContent = 'Guardando…';
   try {
-    const r = await (await fetch('/api/config', {method: 'POST', headers: headers(), body: JSON.stringify(body)})).json();
+    const r = await post('/api/config', {engine: cur, threshold_pct: q('cfgNewThr').value, tp_pct: q('cfgNewTp').value});
     q('cfgMsg').innerHTML = r.ok
       ? `<span class="pos">Guardado en ${esc(last && last.engines[r.engine] ? last.engines[r.engine].label : r.engine)}.</span> Señal ±${r.threshold_pct}% · ${last && last.global.inverted ? 'SL' : 'TP'} ${r.tp_pct}%`
       : `<span class="neg">${esc(r.error)}</span>`;
@@ -1871,60 +2113,85 @@ q('cfgForm').addEventListener('submit', async ev => {
   refresh();
 });
 
-q('glbForm').addEventListener('submit', async ev => {
-  ev.preventDefault();
-  await postGlobal({profit_target_usd: q('glbTarget').value, fee_pct: q('glbFee').value});
-  q('glbTarget').value = ''; q('glbFee').value = '';
-});
-
-async function postGlobal(body, url = '/api/global') {
-  saveToken();
+async function glb(body, url = '/api/global') {
   q('glbMsg').textContent = 'Guardando…';
   try {
-    const r = await (await fetch(url, {method: 'POST', headers: headers(), body: JSON.stringify(body)})).json();
+    const r = await post(url, body);
     q('glbMsg').innerHTML = r.ok
-      ? `<span class="pos">Guardado.</span> ${r.inverted ? 'Modo invertido' : 'Modo normal'} · objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · fee ${r.fee_pct}% por lado`
+      ? `<span class="pos">Guardado.</span> ${r.executor_paused ? 'Envíos al executor pausados · ' : ''}${r.inverted ? 'Modo invertido' : 'Modo normal'} · objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado`
       : `<span class="neg">${esc(r.error)}</span>`;
+    return r.ok;
   } catch (e) { q('glbMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
-  refresh();
+  finally { refresh(); }
 }
+
+q('glbForm').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  if (await glb({profit_target_usd: q('glbTarget').value, max_open: q('glbMax').value, fee_pct: q('glbFee').value})) {
+    q('glbTarget').value = ''; q('glbMax').value = ''; q('glbFee').value = '';
+  }
+});
 
 q('btnInvert').addEventListener('click', () => {
   const inv = !q('btnInvert').dataset.inverted;
   const msg = inv
     ? '¿Invertir los dos bots? Las entradas nuevas irán CONTRA la vela y el % será stop loss, sin TP. Las posiciones abiertas siguen con su TP.'
     : '¿Volver al modo normal? Las entradas nuevas seguirán la vela con TP. Las posiciones abiertas invertidas siguen con su SL.';
-  if (confirm(msg)) postGlobal({inverted: inv});
+  if (confirm(msg)) glb({inverted: inv});
+});
+
+q('btnExPause').addEventListener('click', () => {
+  const p = !q('btnExPause').dataset.paused;
+  const msg = p
+    ? '¿Pausar las entradas al executor? Los bots seguirán operando en simulación (verás posiciones SIMULADAS) pero no se mandará ninguna apertura. Los cierres de lo ya enviado sí se mandan.'
+    : '¿Reanudar los envíos al executor? Las entradas nuevas volverán a abrirse de verdad. Las simuladas que sigan abiertas no se mandan.';
+  if (confirm(msg)) glb({executor_paused: p});
 });
 
 q('btnReset').addEventListener('click', () => {
-  if (confirm('¿Poner a cero el PnL de la sesión? El objetivo se contará desde ahora.')) postGlobal({}, '/api/session/reset');
+  if (confirm('¿Poner a cero el PnL de la sesión? El objetivo se contará desde ahora.')) glb({}, '/api/session/reset');
 });
 
+async function closeAll(engine) {
+  const n = engine ? last.engines[engine].positions.length : last.global.open_count;
+  const who = engine ? `del ${last.engines[engine].label}` : 'de los dos bots';
+  if (!n) { alert(`No hay posiciones abiertas ${who}.`); return; }
+  if (!confirm(`¿Cerrar a mercado las ${n} posiciones abiertas ${who}?`)) return;
+  try {
+    const r = await post('/api/close-all', engine ? {engine} : {});
+    alert(r.ok ? r.msg : r.error);
+  } catch (e) { alert(e); }
+  refresh();
+}
+q('btnCloseAll').addEventListener('click', () => closeAll(null));
+q('btnCloseEng').addEventListener('click', () => closeAll(cur));
+
 document.addEventListener('click', async ev => {
-  const row = ev.target.closest && ev.target.closest('[data-engine]');
-  if (row) {
-    cur = row.dataset.engine;
-    try { localStorage.setItem('botkline_engine', cur); } catch (e) {}
-    q('cfgMsg').textContent = '';
-    if (last) render(last);
-    return;
-  }
-  const dir = ev.target.dataset && ev.target.dataset.block;
-  if (dir) {
-    saveToken();
-    const blocked = !ev.target.dataset.blocked;
-    try {
-      const r = await (await fetch('/api/block', {method: 'POST', headers: headers(), body: JSON.stringify({engine: cur, direction: dir, blocked})})).json();
-      if (!r.ok) alert(r.error);
-    } catch (e) { alert(e); }
+  const t = ev.target, ds = t.dataset || {};
+  if (ds.pause) {
+    const paused = !ds.paused, label = last ? last.engines[ds.pause].label : ds.pause;
+    if (!confirm(paused ? `¿Pausar el ${label}? No abrirá entradas nuevas; sus posiciones abiertas siguen hasta su TP/SL.` : `¿Reanudar el ${label}?`)) return;
+    try { const r = await post('/api/pause', {engine: ds.pause, paused}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
     refresh();
     return;
   }
-  const sym = ev.target.dataset && ev.target.dataset.close;
-  if (!sym || !confirm(`¿Cerrar ${ev.target.dataset.label || sym} a mercado?`)) return;
+  const tab = t.closest && t.closest('[data-engine]');
+  if (tab) {
+    cur = tab.dataset.engine;
+    store.set('botkline_engine', cur);
+    q('cfgMsg').textContent = '';
+    if (last) render(last);
+    if (tab.closest('#bots')) q('tabs').scrollIntoView({behavior: 'smooth'});
+    return;
+  }
+  if (ds.block) {
+    try { const r = await post('/api/block', {engine: cur, direction: ds.block, blocked: !ds.blocked}); if (!r.ok) alert(r.error); } catch (e) { alert(e); }
+    refresh();
+    return;
+  }
+  if (!ds.close || !confirm(`¿Cerrar ${ds.label || ds.close} a mercado?`)) return;
   try {
-    const r = await (await fetch('/api/close/' + encodeURIComponent(sym), {method: 'POST', headers: headers(), body: '{}'})).json();
+    const r = await post('/api/close/' + encodeURIComponent(ds.close), {});
     alert(r.ok ? r.msg : (r.error || r.msg));
   } catch (e) { alert(e); }
   refresh();
