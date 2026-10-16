@@ -334,6 +334,7 @@ class Position:
     strategy:    str = "close"  # bot que la abrió: close | live
     candle_age_s: float = 0.0   # segundos de vela transcurridos al entrar (bot en vivo)
     inverted:    bool = False   # abierta en modo invertido: tp_price es un STOP LOSS
+    sent:        bool = True    # se mandó al executor (False = simulada, envíos pausados)
 
     def update(self, price: float) -> float:
         """Actualiza precio y excursiones. Llamar con el lock del bot tomado."""
@@ -449,6 +450,9 @@ class KlineBot:
         self.profit_target_usd = (float(settings["profit_target_usd"])
                                   if settings.get("profit_target_usd") is not None else PROFIT_TARGET_USD)
         # Objetivo global: PnL realizado acumulado en el último reinicio del contador.
+        # Modo prueba: los bots siguen operando en simulación pero NO mandan
+        # entradas nuevas al executor (los cierres de lo ya enviado sí salen).
+        self.executor_paused = bool(settings.get("executor_paused"))
         self.max_open = (int(settings["max_open"]) if settings.get("max_open") is not None
                          else MAX_OPEN_POSITIONS)
         self.session_base = 0.0
@@ -519,7 +523,8 @@ class KlineBot:
                 "executor_changed_ts": self.executor_changed_ts,
                 "engines": {n: e.settings() for n, e in self.engines.items()},
                 "inverted": self.inverted, "fee_pct": self.fee_pct,
-                "profit_target_usd": self.profit_target_usd, "max_open": self.max_open}
+                "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
+                "executor_paused": self.executor_paused}
         tmp = f"{SETTINGS_FILE}.tmp"
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
@@ -552,7 +557,8 @@ class KlineBot:
         return {"engine": eng.name, "threshold_pct": eng.threshold_pct, "tp_pct": eng.tp_pct}
 
     def set_global(self, inverted: Optional[bool] = None, fee_pct: Optional[float] = None,
-                   profit_target_usd: Optional[float] = None, max_open: Optional[int] = None) -> dict:
+                   profit_target_usd: Optional[float] = None, max_open: Optional[int] = None,
+                   executor_paused: Optional[bool] = None) -> dict:
         """Ajustes comunes a los dos bots. Invertir aplica a las entradas
         nuevas; las abiertas siguen con el modo (TP o SL) con el que se abrieron."""
         changes = []
@@ -569,6 +575,10 @@ class KlineBot:
         if max_open is not None and max_open != self.max_open:
             changes.append(f"límite de abiertas {self.max_open or 'sin límite'} → {max_open or 'sin límite'}")
             self.max_open = max_open
+        if executor_paused is not None and executor_paused != self.executor_paused:
+            self.executor_paused = executor_paused
+            changes.append("envíos al executor PAUSADOS (entradas nuevas solo simuladas)" if executor_paused
+                           else "envíos al executor reanudados")
         if changes:
             self._save_settings()
             self.store.mark_dirty(True)
@@ -577,7 +587,8 @@ class KlineBot:
 
     def global_settings(self) -> dict:
         return {"inverted": self.inverted, "fee_pct": self.fee_pct,
-                "profit_target_usd": self.profit_target_usd, "max_open": self.max_open}
+                "profit_target_usd": self.profit_target_usd, "max_open": self.max_open,
+                "executor_paused": self.executor_paused}
 
     def open_count(self) -> int:
         with self.lock:
@@ -963,6 +974,7 @@ class KlineBot:
             signal_pct=body, candle_open=candle.open, candle_close=candle.close,
             candle_time=candle.open_time, last_price=price,
             strategy=eng.name, candle_age_s=round(age, 2), inverted=inverted,
+            sent=not self.executor_paused,
         )
         with self.lock:
             eng.positions[pos.trade_id] = pos
@@ -974,20 +986,22 @@ class KlineBot:
         decide_ms = (time.perf_counter() - t0) * 1000 if t0 else 0.0
         skip(f"abierta #{pos.trade_id} en {decide_ms:.1f} ms")
         kind = "SL" if inverted else "TP"
-        self.log(f"[{eng.label}] ABRE {direction} {symbol}{' (invertido)' if inverted else ''} | vela {candle.open:g}→{candle.close:g} "
+        self.log(f"[{eng.label}] ABRE {direction} {symbol}{' (invertido)' if inverted else ''}"
+                 f"{'' if pos.sent else ' [SIMULADA: envíos al executor pausados]'} | vela {candle.open:g}→{candle.close:g} "
                  f"({body:+.2f}% a los {age:.0f}s) | px={price:g} qty={qty:g} ({eff:.2f} USDT) | "
                  f"{kind} {pos.tp_price:g} | trade #{pos.trade_id}")
-        self.executor.send({
-            "action":    "open",
-            "trade_id":  pos.trade_id,
-            "symbol":    symbol,
-            "direction": direction,
-            "price":     price,
-            "quantity":  qty,
-            "notional":  round(eff, 4),
-            "level":     round(body, 4),
-            "strategy":  eng.name,
-        }, t0)
+        if pos.sent:
+            self.executor.send({
+                "action":    "open",
+                "trade_id":  pos.trade_id,
+                "symbol":    symbol,
+                "direction": direction,
+                "price":     price,
+                "quantity":  qty,
+                "notional":  round(eff, 4),
+                "level":     round(body, 4),
+                "strategy":  eng.name,
+            }, t0)
         eng._decide_ms.append(decide_ms)
 
     # ── Salidas: ticks de precio (hilo del WS de precios) ─────────────────────
@@ -1088,6 +1102,8 @@ class KlineBot:
             self.store.mark_dirty(True)
             self.log(f"[{eng.label}] CIERRA {pos.direction} {symbol} ({reason}) | entrada {pos.entry_price:g} → "
                      f"{price:g} ({rec['move_pct']:+.2f}%) | PnL neto {pnl:+.4f} USDT (fees {fees:.4f}) | trade #{pos.trade_id}")
+            if not pos.sent:
+                return True                     # simulada: el executor nunca la abrió
             self.executor.send({
                 "action":      "close",
                 "trade_id":    pos.trade_id,
@@ -1472,6 +1488,8 @@ def api_global_set():
     vals = {}
     if "inverted" in data:
         vals["inverted"] = bool(data["inverted"])
+    if "executor_paused" in data:
+        vals["executor_paused"] = bool(data["executor_paused"])
     if data.get("max_open") not in (None, ""):
         try:
             v = int(float(data["max_open"]))
@@ -1605,7 +1623,7 @@ def api_trades():
 TRADE_CSV_COLS = [
     "strategy", "trade_id", "symbol", "direction", "reason", "opened_ts", "closed_at_ts", "duration_s",
     "inverted", "signal_pct", "candle_age_s", "entry_price", "close_price", "qty", "notional", "tp_price",
-    "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
+    "sent", "move_pct", "pnl", "pnl_gross", "fees", "pnl_pct", "mfe_pct", "mae_pct", "mfe_usd", "mae_usd", "time_to_mfe_s",
     "time_to_mae_s", "high_price", "low_price",
 ]
 
@@ -1773,6 +1791,7 @@ HTML = r"""<!doctype html>
       <div class="row">
         <button type="button" id="btnInvert">—</button>
         <button type="button" class="danger" id="btnCloseAll">Cerrar TODAS las posiciones</button>
+        <button type="button" id="btnExPause">—</button>
         <button type="button" class="ghost" id="btnReset">Poner a cero el PnL de la sesión</button>
       </div>
       <div class="muted" id="modeHint" style="margin-top:8px"></div>
@@ -1934,7 +1953,7 @@ function render(d) {
     `<span class="pill ${g.inverted ? 'alert' : 'ok'}">${g.inverted ? 'Modo INVERTIDO' : 'Modo normal'}</span>`,
     ...names.map(n => `<span class="pill ${d.engines[n].config.paused ? 'alert' : 'ok'}">${esc(d.engines[n].label)}: ${d.engines[n].config.paused ? 'pausado' : 'en marcha'}</span>`),
     `<span class="pill ${k.active ? 'ok' : 'bad'}">Velas ${k.active ? 'conectadas' : 'desconectadas'}</span>`,
-    `<span class="pill ${x.url ? (x.errors && x.last_error ? 'alert' : 'ok') : 'bad'}">Executor ${x.url ? 'activo' : 'sin link'}</span>`,
+    `<span class="pill ${!x.url ? 'bad' : g.executor_paused ? 'alert' : (x.errors && x.last_error ? 'alert' : 'ok')}">Executor ${!x.url ? 'sin link' : g.executor_paused ? 'PAUSADO (prueba)' : 'activo'}</span>`,
     `<span class="pill ${p.mode === 'ok' || p.mode === 'local' ? 'ok' : 'alert'}">Estado ${esc(p.mode)}</span>`,
   ].join('');
   q('rules').textContent = g.inverted
@@ -1974,9 +1993,13 @@ function render(d) {
   bi.dataset.inverted = g.inverted ? '1' : '';
   bi.textContent = g.inverted ? 'Modo INVERTIDO · volver a normal' : 'Modo normal · invertir';
   bi.className = g.inverted ? 'warnb' : 'ok';
-  q('modeHint').textContent = g.inverted
+  const bx = q('btnExPause');
+  bx.dataset.paused = g.executor_paused ? '1' : '';
+  bx.textContent = g.executor_paused ? 'Envíos al executor PAUSADOS · reanudar' : 'Pausar entradas al executor (prueba)';
+  bx.className = g.executor_paused ? 'warnb' : 'ghost';
+  q('modeHint').textContent = (g.executor_paused ? 'MODO PRUEBA: las entradas nuevas solo se simulan aquí, no se mandan al executor. ' : '') + (g.inverted
     ? 'Invertido: vela verde → SHORT, roja → LONG. El % de cada bot es stop loss; no hay TP.'
-    : 'Normal: vela verde → LONG, roja → SHORT. El % de cada bot es take profit; no hay stop loss.';
+    : 'Normal: vela verde → LONG, roja → SHORT. El % de cada bot es take profit; no hay stop loss.');
   q('sessHits').textContent = g.target_hits ? `Objetivo alcanzado ${g.target_hits} vez/veces · último: ${g.last_target || '—'}` : 'Al llegar al objetivo se cierran todas las posiciones de los dos bots y el contador vuelve a cero.';
   q('curTarget').textContent = `(ahora ${g.profit_target_usd > 0 ? '+' + g.profit_target_usd : 'apagado'})`;
   q('curMax').textContent = `(ahora ${g.max_open > 0 ? g.max_open : 'sin límite'})`;
@@ -1995,7 +2018,7 @@ function render(d) {
   q('nPos').textContent = e.positions.length;
   q('engPnl').innerHTML = `PnL abierto ${usd(e.unrealized_pnl)} · realizado ${usd(e.realized_pnl)} (${e.wins}/${e.closed_count} ganadas)`;
   q('tPos').innerHTML = e.positions.map(r => `<tr>
-    <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span></td><td>${tag(r.direction)}</td>
+    <td><b>${esc(r.symbol)}</b> <span class="muted">#${r.trade_id}</span>${r.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td><td>${tag(r.direction)}</td>
     <td>${pct(r.signal_pct)}${cur === 'live' ? ` <span class="muted">${Math.round(r.candle_age_s || 0)}s</span>` : ''}</td><td>${num(r.entry_price, 8)}</td><td>${num(r.price, 8)}</td>
     <td>${pct(r.move_pct)}</td><td><span class="muted">${r.inverted ? 'SL' : 'TP'}</span> ${num(r.tp_price, 8)}</td><td>${num(r.notional, 2)}</td><td>${usd(r.pnl)}</td>
     <td>${pct(r.mfe_pct)} <span class="muted">${usd(r.mfe_usd)}</span></td><td>${pct(r.mae_pct)} <span class="muted">${usd(r.mae_usd)}</span></td>
@@ -2027,7 +2050,7 @@ function render(d) {
   q('tClosed').innerHTML = e.closed_trades.map(t => `<tr><td>${esc(t.closed)}</td><td>${esc(t.symbol)}</td><td>${tag(t.direction)}</td>
     <td>${num(t.entry_price, 8)}</td><td>${num(t.close_price, 8)}</td><td>${pct(t.move_pct)}</td><td>${usd(t.pnl)}</td>
     <td class="muted">${num(t.fees || 0, 4)}</td><td>${pct(t.mfe_pct || 0)}</td><td>${pct(t.mae_pct || 0)}</td>
-    <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}</td></tr>`).join('')
+    <td>${dur(t.duration_s || 0)}</td><td>${esc(t.reason)}${t.sent === false ? ' <span class="st off">SIMULADA</span>' : ''}</td></tr>`).join('')
     || '<tr><td colspan="12" class="muted">Aún no hay cierres</td></tr>';
 
   const exc = e.excursions;
@@ -2095,7 +2118,7 @@ async function glb(body, url = '/api/global') {
   try {
     const r = await post(url, body);
     q('glbMsg').innerHTML = r.ok
-      ? `<span class="pos">Guardado.</span> ${r.inverted ? 'Modo invertido' : 'Modo normal'} · objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado`
+      ? `<span class="pos">Guardado.</span> ${r.executor_paused ? 'Envíos al executor pausados · ' : ''}${r.inverted ? 'Modo invertido' : 'Modo normal'} · objetivo ${r.profit_target_usd > 0 ? '+' + r.profit_target_usd + ' USD' : 'apagado'} · límite ${r.max_open > 0 ? r.max_open + ' abiertas' : 'sin límite'} · fee ${r.fee_pct}% por lado`
       : `<span class="neg">${esc(r.error)}</span>`;
     return r.ok;
   } catch (e) { q('glbMsg').innerHTML = `<span class="neg">${esc(e)}</span>`; }
@@ -2115,6 +2138,14 @@ q('btnInvert').addEventListener('click', () => {
     ? '¿Invertir los dos bots? Las entradas nuevas irán CONTRA la vela y el % será stop loss, sin TP. Las posiciones abiertas siguen con su TP.'
     : '¿Volver al modo normal? Las entradas nuevas seguirán la vela con TP. Las posiciones abiertas invertidas siguen con su SL.';
   if (confirm(msg)) glb({inverted: inv});
+});
+
+q('btnExPause').addEventListener('click', () => {
+  const p = !q('btnExPause').dataset.paused;
+  const msg = p
+    ? '¿Pausar las entradas al executor? Los bots seguirán operando en simulación (verás posiciones SIMULADAS) pero no se mandará ninguna apertura. Los cierres de lo ya enviado sí se mandan.'
+    : '¿Reanudar los envíos al executor? Las entradas nuevas volverán a abrirse de verdad. Las simuladas que sigan abiertas no se mandan.';
+  if (confirm(msg)) glb({executor_paused: p});
 });
 
 q('btnReset').addEventListener('click', () => {
